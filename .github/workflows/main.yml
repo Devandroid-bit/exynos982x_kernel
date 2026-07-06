@@ -19,7 +19,7 @@ jobs:
       - name: Update KernelSU-Next pointers
         run: |
           KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
-          KSU_HASH="77b30272a9495146d848a4b1080e287d299ef329"
+          KSU_HASH="eb139a6ded37b812d634f52b79bba1f03224e7ff"
           
           echo "=> Updating KernelSU-Next paths to commit $KSU_HASH"
           
@@ -64,7 +64,7 @@ jobs:
           # Check if there are actually any changes to commit to avoid workflow failure
           if ! git diff --cached --quiet; then
             echo "Changes detected, committing..."
-            git commit -m "chore: update KernelSU-Next pointers to 77b3027"
+            git commit -m "chore: update KernelSU-Next pointers to eb139a6"
             git push
           else
             echo "No changes detected. Pointers are already at $KSU_HASH."
