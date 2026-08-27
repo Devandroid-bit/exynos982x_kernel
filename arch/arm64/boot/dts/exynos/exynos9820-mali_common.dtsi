@@ -44,7 +44,7 @@
 		gpu_min_clock = <156000>;
 		gpu_dvfs_start_clock = <260000>;
 		gpu_dvfs_bl_config_clock = <156000>;
-		gpu_default_voltage = <800000>;
+		gpu_default_voltage = <720000>;
 		gpu_cold_minimum_vol = <0>;
 		gpu_voltage_offset_margin = <37500>;
 		gpu_tmu_control = <1>;
