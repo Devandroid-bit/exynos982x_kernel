@@ -1065,6 +1065,9 @@ static __init int init_table(struct exynos_cpufreq_domain *domain)
 	for (index = 0; index < domain->table_size; index++) {
 		domain->freq_table[index].driver_data = index;
 
+	    /* Undervolt with uV value */
+		volt_table[index] -= (int)(volt_table[index]/10.0);
+
 		if (table[index] > domain->max_freq)
 			domain->freq_table[index].frequency = CPUFREQ_ENTRY_INVALID;
 		else if (table[index] < domain->min_freq)
@@ -1080,6 +1083,7 @@ static __init int init_table(struct exynos_cpufreq_domain *domain)
 
 				dev_pm_opp_add(get_cpu_device(cpu),
 						table[index] * 1000, volt_table[index]);
+				pr_info("volt_table[%d]=%d\n", index, volt_table[index]);
 			}
 		}
 
