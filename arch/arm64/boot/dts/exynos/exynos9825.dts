@@ -4972,8 +4972,8 @@
 			shared-cpus = "0-3";
 
 			boost_table = < 160 949000 123 1300000 100 >;
-			up_rate_limit_table = < 12 >;
-			down_rate_limit_table = < 16 >;
+			up_rate_limit_table = < 4 >;
+			down_rate_limit_table = < 4 >;
 			st_table = < 5 >;
 		};
 		domain@1 {
@@ -4981,8 +4981,8 @@
 			shared-cpus = "4-5";
 
 			boost_table = < 160 962000 123 1222000 100 >;
-			up_rate_limit_table = < 12 >;
-			down_rate_limit_table = < 16 >;
+			up_rate_limit_table = < 4 >;
+			down_rate_limit_table = < 4 >;
 			st_table = < 5 >;
 		};
 		domain@2 {
@@ -4990,8 +4990,8 @@
 			shared-cpus = "6-7";
 
 			boost_table = < 160 936000 123 1378000 100 >;
-			up_rate_limit_table = < 12 >;
-			down_rate_limit_table = < 16 >;
+			up_rate_limit_table = < 4 >;
+			down_rate_limit_table = < 4 >;
 			st_table = < 5 >;
 		};
 	};
