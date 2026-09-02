@@ -115,10 +115,6 @@ d2xks)
     exit
 esac
 
-if [[ "$MODEL" == "d2xks" ]]; then
-    MODEL=d2x
-fi
-
 if [[ "$RECOVERY_OPTION" == "y" ]]; then
     RECOVERY=recovery.config
     KSU_OPTION=n
