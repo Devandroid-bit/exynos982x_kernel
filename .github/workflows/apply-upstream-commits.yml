@@ -29,15 +29,9 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Add source repo as remote
-        run: |
-          git remote add upstream_src "https://github.com/${{ github.event.inputs.source_repo }}.git"
-          git fetch upstream_src
-
-      - name: Apply commits in sequence
+      - name: Apply commits via Direct Patch Download
         id: apply
         run: |
-          # Liste intégrée en dur : plus besoin de l'écrire à la main !
           SHAS=(
             3f94c32f891b20a1223de0f78b2ea5fd2c4330a8
             c821fcf288ca8e6cea2706682b55de34c9f67c8b
@@ -68,19 +62,32 @@ jobs:
             26c98638b40c6ee469e07d6060118958540052b5
             d91be62bee9db2a752735713d1a3df1912f26318
           )
-          
+
           FAILED=""
           for sha in "${SHAS[@]}"; do
-            echo "== Applying $sha =="
-            if ! git cherry-pick -x "$sha"; then
-              echo "WARNING: $sha failed cleanly. Forcing patch application..."
-              git cherry-pick --abort
+            echo "== Applying commit $sha =="
+            
+            # Téléchargement direct du patch (.patch) depuis GitHub
+            curl -sL "https://github.com/${{ github.event.inputs.source_repo }}/commit/$sha.patch" > temp.patch
+            
+            if [ ! -s temp.patch ]; then
+              echo "WARNING: Failed to download patch for $sha"
+              FAILED="$FAILED $sha"
+              continue
+            fi
+            
+            # Application via git am (conserve automatiquement l'auteur, la date et le titre original)
+            if git am temp.patch; then
+              echo "Successfully applied: $sha"
+            else
+              echo "WARNING: Conflict detected on $sha. Aborting git am and forcing via patch..."
+              git am --abort || true
               
-              curl -sL "https://github.com/${{ github.event.inputs.source_repo }}/commit/$sha.patch" > temp.patch
-              patch -p1 -F 3 < temp.patch || echo "Some hunks rejected, creating .rej files"
+              # Application de secours avec tolérance (génère des .rej si besoin)
+              patch -p1 -F 3 < temp.patch || echo "Some hunks rejected"
               
               git add .
-              git commit -C "$sha" || true
+              git commit -m "Force applied commit: $sha (with conflicts)" || true
               
               FAILED="$FAILED $sha"
             fi
@@ -107,6 +114,6 @@ jobs:
             --base "${{ github.event.inputs.target_branch }}" \
             --head "$BRANCH" \
             --title "Partial MGLRU import - manual conflict resolution needed" \
-            --body "Some commits failed to cherry-pick cleanly and were skipped: ${{ steps.apply.outputs.failed_shas }}. Review the diff and resolve manually before merging."
+            --body "Some commits failed to apply cleanly and were skipped/forced: ${{ steps.apply.outputs.failed_shas }}. Review the diff and resolve manually before merging."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
