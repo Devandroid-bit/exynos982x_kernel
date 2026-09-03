@@ -1,0 +1,77 @@
+name: Apply upstream commits (MGLRU series)
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo (owner/name) to pull commits from'
+        required: true
+        default: 'Abhishek001konni/kernel_xiaomi_sm6250'
+      commit_shas:
+        description: 'Comma-separated list of full commit SHAs, in order'
+        required: true
+      target_branch:
+        description: 'Branch in THIS repo to apply onto'
+        required: true
+        default: 'devandroid-no-oc-stock-voltage'
+
+jobs:
+  apply-commits:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Configure Bot Identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add source repo as remote
+        run: |
+          git remote add upstream_src "https://github.com/${{ github.event.inputs.source_repo }}.git"
+          git fetch upstream_src
+
+      - name: Apply commits in sequence
+        id: apply
+        run: |
+          IFS=',' read -ra SHAS <<< "${{ github.event.inputs.commit_shas }}"
+          FAILED=""
+          for sha in "${SHAS[@]}"; do
+            sha=$(echo "$sha" | xargs)  # trim whitespace
+            echo "== Cherry-picking $sha =="
+            if ! git cherry-pick -x "$sha"; then
+              echo "WARNING: $sha failed to apply cleanly"
+              FAILED="$FAILED $sha"
+              git cherry-pick --abort
+            fi
+          done
+          if [ -n "$FAILED" ]; then
+            echo "failed_shas=$FAILED" >> "$GITHUB_OUTPUT"
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push directly if all commits applied cleanly
+        if: steps.apply.outputs.has_failures == 'false'
+        run: |
+          git push origin HEAD:${{ github.event.inputs.target_branch }}
+
+      - name: Push to a new branch and open PR if any commit failed
+        if: steps.apply.outputs.has_failures == 'true'
+        run: |
+          BRANCH="mglru-import-$(date +%s)"
+          git push origin HEAD:"$BRANCH"
+          gh pr create \
+            --base "${{ github.event.inputs.target_branch }}" \
+            --head "$BRANCH" \
+            --title "Partial MGLRU import - manual conflict resolution needed" \
+            --body "Some commits failed to cherry-pick cleanly and were skipped: ${{ steps.apply.outputs.failed_shas }}. Review the diff and resolve manually before merging."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
