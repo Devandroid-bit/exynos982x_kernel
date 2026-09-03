@@ -9,7 +9,7 @@ on:
       target_branch:
         description: 'Branch in THIS repo to apply onto'
         required: true
-        default: 'devandroid-no-oc-undervolt'
+        default: 'devandroid-bit-no-oc-undervolt'
 
 jobs:
   apply-commits:
