@@ -1,0 +1,119 @@
+name: Apply upstream commits (MGLRU series)
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo (owner/name) to pull commits from'
+        required: true
+        default: 'Abhishek001konni/kernel_xiaomi_sm6250'
+      target_branch:
+        description: 'Branch in THIS repo to apply onto'
+        required: true
+        default: 'devandroid-no-oc-undervolt'
+
+jobs:
+  apply-commits:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Configure Bot Identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply commits via Direct Patch Download
+        id: apply
+        run: |
+          SHAS=(
+            3f94c32f891b20a1223de0f78b2ea5fd2c4330a8
+            c821fcf288ca8e6cea2706682b55de34c9f67c8b
+            9da620561dff4bd3b1ffb803bc160ccf1bfe5192
+            8ee572f11f1af9ea28893a4f83a8d38a937f3d6c
+            9b914a084fe30a4e95ee1449e68ca485fc411c5c
+            8e924e5a0bb87f2e93c2c4478c3e29a6bc7b6f25
+            a503280e6cf785c978e3b2a2ad6b113ef06cb1df
+            0a3ceb4377d0b25548b46733bc2ee0f8b3ef33ae
+            57bde9a247c6c1db6f58608bc9a9df99ac16c15e
+            1dc7f36ed868f2e02f865bfcafbc04e11e0f3c3b
+            1da875d79ee9445eb82db6964d20b7f66e960db0
+            447a25d8e0fde18f0311a4af8d69a7344ad3137d
+            21cdb0348fb2feb07506fca8adf9867904141714
+            6d1d69ca1fe432be12f42030109e23029d92a527
+            266f82f59d853e9632f9f32029e5649a89d97c93
+            7c27b58de96afa745197617331107aa8d31d1974
+            0f8ab5926a0ee3a9e71cf8514ce8ff1781f8eadbc
+            e8a2a775dbd032ba159ded4c35d224419a2938b8
+            ec6789ea15f42b761556f8abe64facfb327a5ead
+            6c3bfb6d75d55e5139121e26fc38761b5aba77ce
+            92764065fec3070fbd73c527754e21b83d71e15c
+            1a769aca00142fbe55d9140c3a45f4193d8799bd
+            8b2a31b6faa5c50ee6dc99b582ece928e1b34194
+            e20470e397497dc61f6d380e6832e7052a7b5611
+            25a01a7cdf6160853c7a38ac7458f4e294bd8c46
+            0f1f2224a54d50aa92298307669a8299281f1630
+            26c98638b40c6ee469e07d6060118958540052b5
+            d91be62bee9db2a752735713d1a3df1912f26318
+          )
+
+          FAILED=""
+          for sha in "${SHAS[@]}"; do
+            echo "== Applying commit $sha =="
+            
+            # Téléchargement direct du patch (.patch) depuis GitHub
+            curl -sL "https://github.com/${{ github.event.inputs.source_repo }}/commit/$sha.patch" > temp.patch
+            
+            if [ ! -s temp.patch ]; then
+              echo "WARNING: Failed to download patch for $sha"
+              FAILED="$FAILED $sha"
+              continue
+            fi
+            
+            # Application via git am (conserve automatiquement l'auteur, la date et le titre original)
+            if git am temp.patch; then
+              echo "Successfully applied: $sha"
+            else
+              echo "WARNING: Conflict detected on $sha. Aborting git am and forcing via patch..."
+              git am --abort || true
+              
+              # Application de secours avec tolérance (génère des .rej si besoin)
+              patch -p1 -F 3 < temp.patch || echo "Some hunks rejected"
+              
+              git add .
+              git commit -m "Force applied commit: $sha (with conflicts)" || true
+              
+              FAILED="$FAILED $sha"
+            fi
+          done
+          
+          if [ -n "$FAILED" ]; then
+            echo "failed_shas=$FAILED" >> "$GITHUB_OUTPUT"
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push directly if all commits applied cleanly
+        if: steps.apply.outputs.has_failures == 'false'
+        run: |
+          git push origin HEAD:${{ github.event.inputs.target_branch }}
+
+      - name: Push to a new branch and open PR if any commit failed
+        if: steps.apply.outputs.has_failures == 'true'
+        run: |
+          BRANCH="mglru-import-$(date +%s)"
+          git push origin HEAD:"$BRANCH"
+          gh pr create \
+            --base "${{ github.event.inputs.target_branch }}" \
+            --head "$BRANCH" \
+            --title "Partial MGLRU import - manual conflict resolution needed" \
+            --body "Some commits failed to apply cleanly and were skipped/forced: ${{ steps.apply.outputs.failed_shas }}. Review the diff and resolve manually before merging."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
