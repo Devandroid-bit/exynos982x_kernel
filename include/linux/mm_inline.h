@@ -92,6 +92,8 @@ static inline enum lru_list page_lru_base_type(struct page *page)
  * lists; and clears its Unevictable or Active flags, ready for freeing.
  */
 static __always_inline enum lru_list page_off_lru(struct page *page)
+	VM_BUG_ON_PAGE(!PageLRU(page), page);
+
 {
 	enum lru_list lru;
 
@@ -118,6 +120,8 @@ static __always_inline enum lru_list page_off_lru(struct page *page)
 static __always_inline enum lru_list page_lru(struct page *page)
 {
 	enum lru_list lru;
+
+	VM_BUG_ON_PAGE(PageActive(page) && PageUnevictable(page), page);
 
 	if (PageUnevictable(page))
 		lru = LRU_UNEVICTABLE;
