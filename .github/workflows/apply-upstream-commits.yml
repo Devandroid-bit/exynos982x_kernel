@@ -43,14 +43,22 @@ jobs:
           IFS=',' read -ra SHAS <<< "${{ github.event.inputs.commit_shas }}"
           FAILED=""
           for sha in "${SHAS[@]}"; do
-            sha=$(echo "$sha" | xargs)  # trim whitespace
-            echo "== Cherry-picking $sha =="
+            sha=$(echo "$sha" | xargs)
+            echo "== Applying $sha =="
             if ! git cherry-pick -x "$sha"; then
-              echo "WARNING: $sha failed to apply cleanly"
-              FAILED="$FAILED $sha"
+              echo "WARNING: $sha failed cleanly. Forcing patch application..."
               git cherry-pick --abort
+              
+              curl -sL "https://github.com/${{ github.event.inputs.source_repo }}/commit/$sha.patch" > temp.patch
+              patch -p1 -F 3 < temp.patch || echo "Some hunks rejected, creating .rej files"
+              
+              git add .
+              git commit -m "Force applied (with potential .rej): $sha" || true
+              
+              FAILED="$FAILED $sha"
             fi
           done
+          
           if [ -n "$FAILED" ]; then
             echo "failed_shas=$FAILED" >> "$GITHUB_OUTPUT"
             echo "has_failures=true" >> "$GITHUB_OUTPUT"
