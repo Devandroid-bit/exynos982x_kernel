@@ -1,0 +1,40 @@
+name: Apply BORE Scheduler Patch to New Branch
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Base Branch
+        uses: actions/checkout@v4
+        with:
+          ref: Devandroid-bit-no-oc-undervolt
+          fetch-depth: 0
+
+      - name: Configure Git Identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and Switch to New Branch
+        run: |
+          git checkout -b Devandroid-bit-no-oc-bore-undervolt
+
+      - name: Fetch and Apply BORE Patch
+        run: |
+          PATCH_URL="https://github.com/sidex15/android_kernel_lge_sm8150/commit/01baff0ae3abea5027d0cd5b827dab46465f0373.patch"
+          
+          echo "Fetching patch from: $PATCH_URL"
+          curl -sSL "$PATCH_URL" -o bore.patch
+
+          echo "Applying patch via 3-way merge..."
+          git am --3way bore.patch
+
+      - name: Push to New Remote Branch
+        run: |
+          git push -u origin Devandroid-bit-no-oc-bore-undervolt
