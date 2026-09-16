@@ -1,16 +1,16 @@
-name: Apply BORE Scheduler Patch to New Branch
+name: Apply BORE Patch to Exynos Branch
 
 on:
   workflow_dispatch:
 
 jobs:
-  apply-patch:
+  apply-bore-patch:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout Base Branch
+      - name: Checkout Source Branch
         uses: actions/checkout@v4
         with:
           ref: Devandroid-bit-no-oc-undervolt
@@ -21,40 +21,28 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Create and Switch to New Branch
+      - name: Create Target Branch
         run: |
           git checkout -b Devandroid-bit-no-oc-bore-undervolt
 
-      - name: Fetch and Apply BORE Patch
+      - name: Fetch SM8150 BORE Patch
         run: |
-          PATCH_URL="https://github.com/sidex15/android_kernel_lge_sm8150/commit/01baff0ae3abea5027d0cd5b827dab46465f0373.patch"
-          
-          echo "Fetching patch from: $PATCH_URL"
-          curl -sSL "$PATCH_URL" -o bore.patch
+          curl -sSL "https://github.com/sidex15/android_kernel_lge_sm8150/commit/01baff0ae3abea5027d0cd5b827dab46465f0373.patch" -o bore.patch
 
-          echo "Applying patch via 3-way merge..."
-          # git am applies the patch and retains the original Git author metadata natively
-          git am --3way bore.patch
-
-      - name: Format Title and Append Credits
+      - name: Apply Patch via GNU Patch
         run: |
-          # Extract original commit metadata
-          ORIG_TITLE=$(git log -1 --pretty=%s)
-          ORIG_BODY=$(git log -1 --pretty=%b)
-          ORIG_AUTHOR=$(git log -1 --pretty="%an <%ae>")
+          # 'patch -p1' uses fuzzy line matching instead of strict Git SHA ancestor blobs
+          patch -p1 --ignore-whitespace < bore.patch
+          rm bore.patch
 
-          # Build the new explicit commit message
-          echo "$ORIG_TITLE" > commit_msg.txt
-          echo "" >> commit_msg.txt
-          echo "$ORIG_BODY" >> commit_msg.txt
-          echo "" >> commit_msg.txt
-          echo "----------------------------------------" >> commit_msg.txt
-          echo "Credits to original author: $ORIG_AUTHOR" >> commit_msg.txt
-          echo "Adapted for Exynos 9820/982x via automated patch." >> commit_msg.txt
+      - name: Commit with Original Credits
+        run: |
+          git add -A
+          git commit -m "sched: import BORE Scheduler 5.1.0" \
+                     -m "Source commit: 01baff0ae3abea5027d0cd5b827dab46465f0373" \
+                     -m "Credits to original author: sidex15" \
+                     -m "Applied to Exynos 9820/9825 kernel tree via automated workflow."
 
-          # Amend the commit message with the new text
-          git commit --amend -F commit_msg.txt
-
-      - name: Push to New Remote Branch
+      - name: Push to Devandroid-bit-no-oc-bore-undervolt
         run: |
           git push -u origin Devandroid-bit-no-oc-bore-undervolt
