@@ -33,7 +33,27 @@ jobs:
           curl -sSL "$PATCH_URL" -o bore.patch
 
           echo "Applying patch via 3-way merge..."
+          # git am applies the patch and retains the original Git author metadata natively
           git am --3way bore.patch
+
+      - name: Format Title and Append Credits
+        run: |
+          # Extract original commit metadata
+          ORIG_TITLE=$(git log -1 --pretty=%s)
+          ORIG_BODY=$(git log -1 --pretty=%b)
+          ORIG_AUTHOR=$(git log -1 --pretty="%an <%ae>")
+
+          # Build the new explicit commit message
+          echo "$ORIG_TITLE" > commit_msg.txt
+          echo "" >> commit_msg.txt
+          echo "$ORIG_BODY" >> commit_msg.txt
+          echo "" >> commit_msg.txt
+          echo "----------------------------------------" >> commit_msg.txt
+          echo "Credits to original author: $ORIG_AUTHOR" >> commit_msg.txt
+          echo "Adapted for Exynos 9820/982x via automated patch." >> commit_msg.txt
+
+          # Amend the commit message with the new text
+          git commit --amend -F commit_msg.txt
 
       - name: Push to New Remote Branch
         run: |
