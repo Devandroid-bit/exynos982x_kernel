@@ -48,7 +48,7 @@ pushd "$(dirname "$0")" > /dev/null || exit 1
 CORES=$(grep -c processor /proc/cpuinfo)
 
 # ============================================================
-# LLVM TOOLCHAIN
+# TOOLCHAIN
 # ============================================================
 
 CLANG_DIR="$PWD/toolchain/clang-r547379"
@@ -58,28 +58,29 @@ echo "-----------------------------------------------"
 echo "Checking LLVM toolchain..."
 echo "-----------------------------------------------"
 
-# Check whether the complete toolchain is available.
-# Do not only check clang: llvm-ar and llvm-nm are also
-# required by the kernel build system.
+# Required LLVM binaries
+LLVM_TOOLS=(
+    clang-20
+    llvm-ar
+    llvm-nm
+    llvm-objcopy
+    llvm-objdump
+    llvm-strip
+    ld.lld
+)
+
 TOOLCHAIN_MISSING=false
 
-for tool in \
-    clang-20 \
-    llvm-ar \
-    llvm-nm \
-    llvm-objcopy \
-    llvm-objdump \
-    llvm-strip \
-    ld.lld
-do
+for tool in "${LLVM_TOOLS[@]}"; do
     if [[ ! -x "$CLANG_BIN/$tool" ]]; then
         echo "Missing LLVM tool: $CLANG_BIN/$tool"
         TOOLCHAIN_MISSING=true
     fi
 done
 
-# Download the toolchain if anything is missing.
+# Download a fresh toolchain if incomplete
 if [[ "$TOOLCHAIN_MISSING" == true ]]; then
+
     echo "-----------------------------------------------"
     echo "LLVM toolchain incomplete or missing!"
     echo "Downloading clang-r547379..."
@@ -121,7 +122,7 @@ if [[ "$TOOLCHAIN_MISSING" == true ]]; then
     popd > /dev/null || exit 1
 fi
 
-# Make sure LLVM binaries are executable.
+# Ensure the LLVM binaries are executable
 chmod +x \
     "$CLANG_BIN/clang-20" \
     "$CLANG_BIN/llvm-ar" \
@@ -132,27 +133,18 @@ chmod +x \
     "$CLANG_BIN/ld.lld" \
     2>/dev/null
 
-# Final toolchain validation.
-for tool in \
-    clang-20 \
-    llvm-ar \
-    llvm-nm \
-    llvm-objcopy \
-    llvm-objdump \
-    llvm-strip \
-    ld.lld
-do
+# Final verification
+for tool in "${LLVM_TOOLS[@]}"; do
     if [[ ! -x "$CLANG_BIN/$tool" ]]; then
         echo "-----------------------------------------------"
         echo "ERROR: LLVM toolchain is incomplete!"
-        echo "Missing:"
-        echo "  $CLANG_BIN/$tool"
+        echo "Missing: $CLANG_BIN/$tool"
         echo "-----------------------------------------------"
         exit 1
     fi
 done
 
-# Put the bundled LLVM first in PATH.
+# Put our bundled LLVM first in PATH
 export PATH="$CLANG_BIN:$PATH"
 
 echo "LLVM toolchain verified:"
@@ -166,7 +158,7 @@ echo "  linker:   $CLANG_BIN/ld.lld"
 echo "-----------------------------------------------"
 
 # ============================================================
-# MODEL CONFIGURATION
+# DEVICE CONFIGURATION
 # ============================================================
 
 case "$MODEL" in
@@ -213,12 +205,15 @@ d2xks)
 esac
 
 # ============================================================
-# RECOVERY / KSU OPTIONS
+# RECOVERY / KERNELSU
 # ============================================================
 
+KSU=""
+RECOVERY=""
+
 if [[ "$RECOVERY_OPTION" == "y" ]]; then
-    RECOVERY=recovery.config
-    KSU_OPTION=n
+    RECOVERY="recovery.config"
+    KSU_OPTION="n"
 fi
 
 if [[ -z "$KSU_OPTION" ]]; then
@@ -226,7 +221,7 @@ if [[ -z "$KSU_OPTION" ]]; then
 fi
 
 if [[ "$KSU_OPTION" == "y" ]]; then
-    KSU=ksu.config
+    KSU="ksu.config"
 fi
 
 # ============================================================
@@ -243,13 +238,15 @@ mkdir -p \
 # MAKE ARGUMENTS
 # ============================================================
 
-# IMPORTANT:
-# Explicitly point Kbuild to our bundled LLVM installation.
+# Explicitly use the bundled LLVM toolchain.
 #
-# This prevents llvm-ar / llvm-nm from depending on whatever
-# happens to be installed in the GitHub Actions runner PATH.
+# This is the important fix for:
+#   llvm-ar: not found
+#   llvm-nm: not found
 #
-# The trailing '/' after CLANG_BIN is intentional.
+# Using an array prevents empty variables from becoming
+# accidental make arguments.
+
 MAKE_ARGS=(
     "LLVM=$CLANG_BIN/"
     "LLVM_IAS=1"
@@ -262,18 +259,21 @@ MAKE_ARGS=(
 # ============================================================
 
 echo "-----------------------------------------------"
-echo "Defconfig: $KERNEL_DEFCONFIG"
+echo "Model: $MODEL"
+echo "SoC: $SOC"
+echo "Board: $BOARD"
+echo "Defconfig: exynos9820_defconfig"
 
-if [[ -z "$KSU" ]]; then
-    echo "KSU: No"
-else
+if [[ -n "$KSU" ]]; then
     echo "KSU: Yes"
+else
+    echo "KSU: No"
 fi
 
-if [[ -z "$RECOVERY" ]]; then
-    echo "Recovery: N"
+if [[ -n "$RECOVERY" ]]; then
+    echo "Recovery: Yes"
 else
-    echo "Recovery: Y"
+    echo "Recovery: No"
 fi
 
 echo "LLVM: $CLANG_BIN/"
@@ -281,19 +281,36 @@ echo "Jobs: $CORES"
 echo "-----------------------------------------------"
 
 # ============================================================
-# GENERATE KERNEL CONFIGURATION
+# GENERATE CONFIGURATION
 # ============================================================
 
-echo "Building kernel using $KERNEL_DEFCONFIG"
+echo "Building kernel using exynos9820_defconfig"
 echo "Generating configuration file..."
 echo "-----------------------------------------------"
 
+# Keep the original multi-device configuration behavior:
+#
+#   exynos9820_defconfig
+#   $MODEL.config
+#   ksu.config       (if enabled)
+#   recovery.config  (if enabled)
+
+CONFIG_ARGS=(
+    exynos9820_defconfig
+    "$MODEL.config"
+)
+
+if [[ -n "$KSU" ]]; then
+    CONFIG_ARGS+=("$KSU")
+fi
+
+if [[ -n "$RECOVERY" ]]; then
+    CONFIG_ARGS+=("$RECOVERY")
+fi
+
 make "${MAKE_ARGS[@]}" \
     -j"$CORES" \
-    exynos9820_defconfig \
-    "$MODEL.config" \
-    "$KSU" \
-    "$RECOVERY" || abort
+    "${CONFIG_ARGS[@]}" || abort
 
 # ============================================================
 # BUILD KERNEL
@@ -344,7 +361,9 @@ if [[ ! -f "out/arch/arm64/boot/Image" ]]; then
     abort
 fi
 
-cp "out/arch/arm64/boot/Image" "build/out/$MODEL/Image" || abort
+cp \
+    "out/arch/arm64/boot/Image" \
+    "build/out/$MODEL/Image" || abort
 
 # ============================================================
 # BUILD DTB
@@ -353,6 +372,7 @@ cp "out/arch/arm64/boot/Image" "build/out/$MODEL/Image" || abort
 echo "-----------------------------------------------"
 
 if [[ "$SOC" == "exynos9820" ]]; then
+
     echo "Building common exynos9820 Device Tree Blob Image..."
     echo "-----------------------------------------------"
 
@@ -361,9 +381,11 @@ if [[ "$SOC" == "exynos9820" ]]; then
         "build/out/$MODEL/dtb.img" \
         build/dtconfigs/exynos9820.cfg \
         -d out/arch/arm64/boot/dts/exynos || abort
+
 fi
 
 if [[ "$SOC" == "exynos9825" ]]; then
+
     echo "Building common exynos9825 Device Tree Blob Image..."
     echo "-----------------------------------------------"
 
@@ -372,6 +394,7 @@ if [[ "$SOC" == "exynos9825" ]]; then
         "build/out/$MODEL/dtb.img" \
         build/dtconfigs/exynos9825.cfg \
         -d out/arch/arm64/boot/dts/exynos || abort
+
 fi
 
 echo "-----------------------------------------------"
@@ -392,7 +415,7 @@ echo "-----------------------------------------------"
 echo "-----------------------------------------------"
 
 # ============================================================
-# BUILD RECOVERY / BOOT RAMDISK
+# BUILD RAMDISK / BOOT IMAGE
 # ============================================================
 
 if [[ -z "$RECOVERY" ]]; then
@@ -482,7 +505,7 @@ if [[ -z "$RECOVERY" ]]; then
     fi
 
     # ========================================================
-    # ZIP NAME
+    # BUILD ZIP
     # ========================================================
 
     pushd "build/out/$MODEL/zip" > /dev/null || abort
@@ -498,6 +521,7 @@ if [[ -z "$RECOVERY" ]]; then
     zip -r "../$NAME" . || abort
 
     popd > /dev/null || abort
+
 fi
 
 # ============================================================
