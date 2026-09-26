@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [d1, d2s, d2x]
+        target: [d1, d2x]
 
     steps:
       - name: Checkout source
