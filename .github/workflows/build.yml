@@ -1,4 +1,4 @@
-name: Build ArtisanKRNL
+name: Build DevandroidKRNL
 
 on:
   workflow_dispatch:
