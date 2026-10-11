@@ -1,0 +1,148 @@
+
+name: Droidspaces patches - Exynos 9820 4.14
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-droidspaces:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: devandroid-no-oc-stock-voltage
+          fetch-depth: 0
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create destination branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git switch -c devandroid-no-oc-stock-voltage-droidspaces
+
+      - name: Install patch utility
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y patch
+
+      - name: Clone Droidspaces-OSS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth=1 \
+            https://github.com/Star-Seven/Droidspaces-OSS.git \
+            "$RUNNER_TEMP/droidspaces"
+
+          PATCH_DIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
+
+          if [ ! -d "$PATCH_DIR" ]; then
+            echo "::error::Droidspaces non-GKI patch directory not found"
+            exit 1
+          fi
+
+      - name: Apply xt_qtaguid fix when applicable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_DIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
+          PATCH_FILE="$PATCH_DIR/01.fix_kernel_panic_in_xt_qtaguid.patch"
+
+          cd "$GITHUB_WORKSPACE"
+
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+            if [ ! -f "$PATCH_FILE" ]; then
+              echo "::error::xt_qtaguid patch not found"
+              exit 1
+            fi
+
+            if ! patch --dry-run --batch --forward -p1 < "$PATCH_FILE"; then
+              echo "::error::xt_qtaguid patch is incompatible with this source"
+              exit 1
+            fi
+
+            patch --batch --forward -p1 < "$PATCH_FILE"
+          else
+            echo "Skipping xt_qtaguid fix: source file is absent"
+          fi
+
+      - name: Apply cgroup file prefix fix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_DIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
+
+          cd "$GITHUB_WORKSPACE"
+
+          if [ ! -f kernel/cgroup/cgroup.c ]; then
+            echo "::error::kernel/cgroup/cgroup.c not found"
+            exit 1
+          fi
+
+          PATCH_FILE="$PATCH_DIR/02.fix_restore cgroup file prefix handling .patch"
+
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "::error::Cgroup prefix patch not found"
+            echo "Available patches:"
+            find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -print
+            exit 1
+          fi
+
+          if ! patch --dry-run --batch --forward -p1 < "$PATCH_FILE"; then
+            echo "::error::Cgroup prefix fix does not apply cleanly to this kernel"
+            exit 1
+          fi
+
+          patch --batch --forward -p1 < "$PATCH_FILE"
+
+      - name: Validate changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff --check
+
+          if git diff --quiet; then
+            echo "::error::No changes were produced"
+            exit 1
+          fi
+
+          echo "Kernel changes:"
+          git diff --stat
+          git status --short
+
+      - name: Commit patches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -A
+
+          git commit \
+            -m "Apply Droidspaces fixes for Exynos 9820 kernel"
+
+      - name: Push Droidspaces branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git push origin \
+            HEAD:refs/heads/devandroid-no-oc-stock-voltage-droidspaces
