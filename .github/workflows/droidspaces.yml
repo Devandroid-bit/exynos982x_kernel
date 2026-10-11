@@ -7,9 +7,17 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: droidspaces-kernel-patches
+  cancel-in-progress: false
+
 jobs:
   apply-droidspaces:
     runs-on: ubuntu-latest
+
+    env:
+      SOURCE_BRANCH: devandroid-no-oc-stock-voltage
+      TARGET_BRANCH: devandroid-no-oc-stock-voltage-droidspaces
 
     steps:
       - name: Checkout source branch
@@ -17,6 +25,7 @@ jobs:
         with:
           ref: devandroid-no-oc-stock-voltage
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Configure Git
         shell: bash
@@ -32,12 +41,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          git switch -c devandroid-no-oc-stock-voltage-droidspaces
+          git switch -c "$TARGET_BRANCH"
 
       - name: Install patch utility
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y patch
 
@@ -52,97 +62,133 @@ jobs:
 
           PATCH_DIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
 
-          if [ ! -d "$PATCH_DIR" ]; then
+          test -d "$PATCH_DIR" || {
             echo "::error::Droidspaces non-GKI patch directory not found"
             exit 1
-          fi
+          }
 
-      - name: Apply xt_qtaguid fix when applicable
+          echo "Available patches:"
+          find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -print
+
+      - name: Apply patch 01 - xt_qtaguid kernel panic fix
         shell: bash
         run: |
           set -euo pipefail
 
           PATCH_DIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
           PATCH_FILE="$PATCH_DIR/01.fix_kernel_panic_in_xt_qtaguid.patch"
+          TARGET_FILE="net/netfilter/xt_qtaguid.c"
 
           cd "$GITHUB_WORKSPACE"
 
-          if [ -f net/netfilter/xt_qtaguid.c ]; then
-            if [ ! -f "$PATCH_FILE" ]; then
-              echo "::error::xt_qtaguid patch not found"
-              exit 1
-            fi
-
-            if ! patch --dry-run --batch --forward -p1 < "$PATCH_FILE"; then
-              echo "::error::xt_qtaguid patch is incompatible with this source"
-              exit 1
-            fi
-
-            patch --batch --forward -p1 < "$PATCH_FILE"
-          else
-            echo "Skipping xt_qtaguid fix: source file is absent"
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "::error::xt_qtaguid patch file not found"
+            exit 1
           fi
 
-      - name: Apply cgroup file prefix fix
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "::error::Required source file is missing: $TARGET_FILE"
+            echo "Searching for xt_qtaguid.c in this repository:"
+
+            find . \
+              -type d -name .git -prune -o \
+              -type f -name 'xt_qtaguid.c' -print
+
+            echo "::error::Patch 01 was NOT applied. Adapt it to the actual Linux 4.14 source before proceeding."
+            exit 1
+          fi
+
+          if patch --dry-run --batch --forward -p1 < "$PATCH_FILE"; then
+            patch --batch --forward -p1 < "$PATCH_FILE"
+            echo "Patch 01 applied successfully."
+
+          elif patch --dry-run --batch --reverse -p1 < "$PATCH_FILE"; then
+            echo "Patch 01 is already present; no duplicate application."
+
+          else
+            echo "::error::Patch 01 is incompatible with this kernel source."
+            exit 1
+          fi
+
+      - name: Apply patch 02 - cgroup file prefix fix
         shell: bash
         run: |
           set -euo pipefail
 
           PATCH_DIR="$RUNNER_TEMP/droidspaces/Documentation/resources/kernel-patches/non-GKI"
+          PATCH_FILE="$PATCH_DIR/02.fix_restore cgroup file prefix handling .patch"
 
           cd "$GITHUB_WORKSPACE"
 
-          if [ ! -f kernel/cgroup/cgroup.c ]; then
-            echo "::error::kernel/cgroup/cgroup.c not found"
-            exit 1
-          fi
-
-          PATCH_FILE="$PATCH_DIR/02.fix_restore cgroup file prefix handling .patch"
-
           if [ ! -f "$PATCH_FILE" ]; then
             echo "::error::Cgroup prefix patch not found"
-            echo "Available patches:"
             find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -print
             exit 1
           fi
 
-          if ! patch --dry-run --batch --forward -p1 < "$PATCH_FILE"; then
-            echo "::error::Cgroup prefix fix does not apply cleanly to this kernel"
+          if [ ! -f kernel/cgroup/cgroup.c ]; then
+            echo "::error::kernel/cgroup/cgroup.c is missing"
             exit 1
           fi
 
-          patch --batch --forward -p1 < "$PATCH_FILE"
+          if patch --dry-run --batch --forward -p1 < "$PATCH_FILE"; then
+            patch --batch --forward -p1 < "$PATCH_FILE"
+            echo "Patch 02 applied successfully."
 
-      - name: Validate changes
+          elif patch --dry-run --batch --reverse -p1 < "$PATCH_FILE"; then
+            echo "Patch 02 is already present; no duplicate application."
+
+          else
+            echo "::error::Cgroup prefix patch is incompatible with this kernel source."
+            exit 1
+          fi
+
+      - name: Validate kernel changes
         shell: bash
         run: |
           set -euo pipefail
 
           git diff --check
 
-          if git diff --quiet; then
-            echo "::error::No changes were produced"
-            exit 1
-          fi
+          echo "=== Kernel version ==="
+          make -s kernelversion
 
-          echo "Kernel changes:"
+          echo "=== Changes ==="
           git diff --stat
           git status --short
 
-      - name: Commit patches
+      - name: Commit Droidspaces patches
         shell: bash
         run: |
           set -euo pipefail
 
-          git add -A
+          if ! git diff --quiet; then
+            git add -A
 
-          git commit \
-            -m "Apply Droidspaces fixes for Exynos 9820 kernel"
+            git commit \
+              -m "Apply Droidspaces fixes for Exynos 9820 kernel"
+          else
+            echo "Both patches are already present; no new commit needed."
+          fi
 
-      - name: Push Droidspaces branch
+      - name: Push destination branch
         shell: bash
         run: |
           set -euo pipefail
 
-          git push origin \
-            HEAD:refs/heads/devandroid-no-oc-stock-voltage-droidspaces
+          REMOTE_SHA="$(
+            git ls-remote --heads origin \
+              "refs/heads/${TARGET_BRANCH}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+
+          if [ -n "$REMOTE_SHA" ]; then
+            echo "Destination branch exists; updating generated branch."
+
+            git push origin HEAD:"refs/heads/${TARGET_BRANCH}" \
+              --force-with-lease="refs/heads/${TARGET_BRANCH}:${REMOTE_SHA}"
+          else
+            git push origin HEAD:"refs/heads/${TARGET_BRANCH}"
+          fi
+
+          echo "Destination branch: $TARGET_BRANCH"
