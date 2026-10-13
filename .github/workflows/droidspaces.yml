@@ -136,7 +136,8 @@ jobs:
           git add -A
 
           git commit \
-            -m "Apply Droidspaces fixes for Exynos 9820 kernel"
+            -m "Apply Droidspaces fixes for Exynos 9820 kernel" \
+            -m "Credits: DroidspacesOSS"
 
       - name: Push Droidspaces branch
         shell: bash
