@@ -65,8 +65,6 @@ int hashtab_insert(struct hashtab *h, void *key, void *datum)
 	if (!preempt_count() && !irqs_disabled())
 		cond_resched();
 
-	cond_resched();
-
 	if (!h || h->nel == HASHTAB_MAX_NODES)
 		return -EINVAL;
 
