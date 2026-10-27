@@ -1,0 +1,68 @@
+name: Apply MGLRU patch to branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch"
+        required: true
+        default: "devandroid-no-oc-stock-voltage-droidspaces"
+      target_branch:
+        description: "Target branch"
+        required: true
+        default: "devandroid-no-oc-stock-voltage-droidspaces-mglru"
+      patch_file:
+        description: "Patch file path"
+        required: true
+        default: "mglru-exynos9820.patch"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mglru-branch-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Verify patch
+        run: |
+          test -f "${{ inputs.patch_file }}"
+
+      - name: Apply MGLRU patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${{ inputs.target_branch }}"
+
+          if grep -q '^config LRU_GEN$' mm/Kconfig; then
+            echo "MGLRU already present in base branch"
+          else
+            git am --keep-cr "${{ inputs.patch_file }}"
+          fi
+
+          git log -1 --format='Author: %an <%ae>'
+          grep -q '^CONFIG_LRU_GEN=y' arch/arm64/configs/d1.config
+          grep -q '^CONFIG_LRU_GEN=y' arch/arm64/configs/d1xks.config
+          grep -q '^CONFIG_LRU_GEN=y' arch/arm64/configs/d2s.config
+          grep -q '^CONFIG_LRU_GEN=y' arch/arm64/configs/d2x.config
+          grep -q '^CONFIG_LRU_GEN=y' arch/arm64/configs/d2xks.config
+
+      - name: Push target branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || true
+          git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "### MGLRU branch applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`$(git rev-parse --short HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
