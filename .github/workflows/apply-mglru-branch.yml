@@ -12,9 +12,13 @@ on:
         required: true
         default: "devandroid-no-oc-stock-voltage-droidspaces-mglru"
       patch_file:
-        description: "Patch file path"
+        description: "Patch file path in the repository"
         required: true
         default: "mglru-exynos9820.patch"
+      patch_url:
+        description: "Optional HTTPS URL to download the patch (overrides patch_file)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -34,20 +38,76 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
-      - name: Verify patch
+      - name: Checkout workflow ref for patch fallback
+        if: ${{ hashFiles(inputs.patch_file, 'mglru-exynos9820.patch', '.github/workflows/mglru-exynos9820.patch', '.github/workflow/mglru-exynos9820.patch', '.github/mglru-exynos9820.patch') == '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: dispatch-ref
+          fetch-depth: 1
+
+      - name: Resolve patch
+        env:
+          PATCH_FILE: ${{ inputs.patch_file }}
+          PATCH_URL: ${{ inputs.patch_url }}
         run: |
-          test -f "${{ inputs.patch_file }}"
+          set -euo pipefail
+          CANDIDATES=(
+            "$PATCH_FILE"
+            "mglru-exynos9820.patch"
+            ".github/workflows/mglru-exynos9820.patch"
+            ".github/workflow/mglru-exynos9820.patch"
+            ".github/mglru-exynos9820.patch"
+          )
+          PATCH=""
+
+          if [ -n "$PATCH_URL" ]; then
+            echo "Downloading patch from URL"
+            curl --proto '=https' --tlsv1.2 -fsSL "$PATCH_URL" -o /tmp/mglru.patch
+            PATCH=/tmp/mglru.patch
+          else
+            for candidate in "${CANDIDATES[@]}"; do
+              if [ -f "$candidate" ]; then
+                PATCH="$candidate"
+                echo "Using patch from base branch: $PATCH"
+                break
+              fi
+            done
+
+            if [ -z "$PATCH" ] && [ -d dispatch-ref ]; then
+              for candidate in "${CANDIDATES[@]}"; do
+                if [ -f "dispatch-ref/$candidate" ]; then
+                  cp "dispatch-ref/$candidate" /tmp/mglru.patch
+                  PATCH=/tmp/mglru.patch
+                  echo "Using patch from workflow ref $GITHUB_SHA: $candidate"
+                  break
+                fi
+              done
+              rm -rf dispatch-ref
+            fi
+          fi
+
+          if [ -z "$PATCH" ] || [ ! -f "$PATCH" ]; then
+            echo "::error::Patch not found. Commit it on the base branch or workflow branch at one of: ${CANDIDATES[*]} (or set patch_url)."
+            exit 1
+          fi
+
+          echo "PATCH_PATH=$PATCH" >> "$GITHUB_ENV"
+          ls -lh "$PATCH"
 
       - name: Apply MGLRU patch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "${{ inputs.target_branch }}"
+          git checkout -B "$TARGET_BRANCH"
 
           if grep -q '^config LRU_GEN$' mm/Kconfig; then
             echo "MGLRU already present in base branch"
           else
-            git am --keep-cr "${{ inputs.patch_file }}"
+            git am --keep-cr "$PATCH_PATH"
           fi
 
           git log -1 --format='Author: %an <%ae>'
@@ -61,6 +121,7 @@ jobs:
         env:
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
+          set -euo pipefail
           git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || true
           git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
           echo "### MGLRU branch applied" >> "$GITHUB_STEP_SUMMARY"
