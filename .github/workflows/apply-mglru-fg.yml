@@ -1,0 +1,106 @@
+name: Apply MGLRU-FG patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to patch"
+        required: true
+        default: "devandroid-no-oc-stock-voltage-droidspaces-mglru"
+      target_branch:
+        description: "Branch to create or update"
+        required: true
+        default: "devandroid--droidspaces-mglru"
+      patch_file:
+        description: "Patch path in the repository"
+        required: true
+        default: ".github/workflows/mglru-fg.patch"
+      patch_url:
+        description: "Optional HTTPS URL to download the patch (overrides patch_file)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mglru-fg-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Checkout workflow ref for patch fallback
+        if: ${{ inputs.patch_url == '' && hashFiles(inputs.patch_file) == '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: dispatch-ref
+          fetch-depth: 1
+
+      - name: Resolve patch
+        env:
+          PATCH_FILE: ${{ inputs.patch_file }}
+          PATCH_URL: ${{ inputs.patch_url }}
+        run: |
+          set -euo pipefail
+          PATCH=""
+
+          if [ -n "$PATCH_URL" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL "$PATCH_URL" -o /tmp/mglru-fg.patch
+            PATCH=/tmp/mglru-fg.patch
+          elif [ -f "$PATCH_FILE" ]; then
+            PATCH="$PATCH_FILE"
+          elif [ -f "dispatch-ref/$PATCH_FILE" ]; then
+            cp "dispatch-ref/$PATCH_FILE" /tmp/mglru-fg.patch
+            PATCH=/tmp/mglru-fg.patch
+          else
+            echo "::error::Patch not found at '$PATCH_FILE' (or set patch_url)."
+            exit 1
+          fi
+
+          rm -rf dispatch-ref
+          echo "PATCH_PATH=$PATCH" >> "$GITHUB_ENV"
+          ls -lh "$PATCH"
+
+      - name: Apply patch and commit
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$TARGET_BRANCH"
+          git apply --check "$PATCH_PATH"
+          git apply --index "$PATCH_PATH"
+
+          if git diff --cached --quiet; then
+            echo "::error::Patch produced no changes."
+            exit 1
+          fi
+
+          git commit -m "mglru: backport frequency-guided promotion" \
+            -m "Backport the MGLRU-FG referenced-count feedback and promotion path, including the refs/workingset shadow encoding and page-table walk promotion. Also fix the existing need_memory_boosting linkage so the kernel links." \
+            -m "Author: @Devandroid-bit."
+
+          git log -1 --format='%B' | awk 'NF { last = $0 } END { exit last == "Author: @Devandroid-bit." ? 0 : 1 }'
+
+      - name: Push target branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || true
+          git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "### MGLRU-FG branch applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`$(git rev-parse --short HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Patch SHA256: \`$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"
