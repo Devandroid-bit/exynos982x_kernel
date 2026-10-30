@@ -14,20 +14,33 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           fetch-depth: 0
 
       - name: Set up build environment
         run: |
-          sudo apt update
-          DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+          sudo apt-get update
+
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
             p7zip-full jq attr ccache clang ffmpeg golang \
             libbrotli-dev libgtest-dev libprotobuf-dev libunwind-dev libpcre2-dev \
-            libzstd-dev linux-modules-extra-$(uname -r) lld protobuf-compiler webp \
+            libzstd-dev lld protobuf-compiler webp \
             curl xxd patchelf flex bison libarchive-tools build-essential pcre2-utils
-          sudo modprobe erofs f2fs
+
+          KERNEL_VERSION="$(uname -r)"
+          EXTRA_MODULES="linux-modules-extra-${KERNEL_VERSION}"
+
+          if apt-cache show "${EXTRA_MODULES}" >/dev/null 2>&1; then
+            sudo apt-get install -yq "${EXTRA_MODULES}"
+          else
+            echo "::notice::${EXTRA_MODULES} is unavailable; skipping optional package."
+          fi
+
+          sudo modprobe erofs || echo "::warning::erofs module unavailable"
+          sudo modprobe f2fs || echo "::warning::f2fs module unavailable"
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -35,7 +48,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
-          sudo apt clean
+          sudo apt-get clean
 
       - name: Make build script executable
         run: chmod +x build.sh
@@ -45,7 +58,7 @@ jobs:
           ./build.sh -m ${{ matrix.target }} -k y -r n
 
       - name: Upload artifact (${{ matrix.target }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: kernel-${{ matrix.target }}
           path: build/out/${{ matrix.target }}/*.zip
