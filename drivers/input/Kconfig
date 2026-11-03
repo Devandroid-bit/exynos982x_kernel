@@ -253,7 +253,28 @@ config SEC_INPUT_BOOSTER
 	help
 	  Say Y here if you need to enable Input Booster.
 
-	  It's triggered in evdev module.
+	  Input events are captured through an input handler and used to
+	  boost CPU and memory frequencies on touch and key press.
+
+config SEC_INPUT_BOOSTER_SLSI
+	bool "SEC INPUT BOOSTER SLSI"
+	depends on SEC_INPUT_BOOSTER
+	default y
+	help
+	  Say Y here to enable the Samsung LSI (Exynos) backend of the
+	  input booster, which drives the CPU/DDR QoS requests.
+
+	  If unsure, say Y.
+
+config SEC_INPUT_BOOSTER_HANDLER
+	bool "SEC INPUT BOOSTER HANDLER"
+	depends on SEC_INPUT_BOOSTER
+	default y
+	help
+	  Say Y here to capture input events through a dedicated input
+	  handler, instead of hooking into evdev.
+
+	  If unsure, say Y.
 
 config SEC_AUTO_INPUT
 	tristate "Samsung auto input"
