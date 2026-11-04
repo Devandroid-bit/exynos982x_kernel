@@ -2860,7 +2860,7 @@ index 76a9652..102aadd 100644
 2.54.0
 
 
-From cd3722b1dd434b7d8ec2011764d2db4768b3face Mon Sep 17 00:00:00 2001
+From 0fbd3af984f53107a603718b6fb06f7c9e7b5fe0 Mon Sep 17 00:00:00 2001
 From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 00:18:56 +0100
 Subject: [PATCH 4/4] input: booster: refresh input booster to v2
@@ -2892,11 +2892,11 @@ Author: @Devandroid-bit.
  drivers/input/Kconfig                   |  23 +-
  drivers/input/Makefile                  |   5 +-
  drivers/input/evdev.c                   |  31 --
- drivers/input/evdev_booster.c           | 514 +++++++++++++++---
- drivers/input/input_booster.c           | 687 ++++++++++++++++--------
+ drivers/input/evdev_booster.c           | 514 ++++++++++++++---
+ drivers/input/input_booster.c           | 699 ++++++++++++++++--------
  drivers/input/input_booster_lsi.c       |  70 ++-
  include/linux/input/input_booster.h     | 131 ++++-
- 8 files changed, 1071 insertions(+), 392 deletions(-)
+ 8 files changed, 1083 insertions(+), 392 deletions(-)
 
 diff --git a/arch/arm64/configs/exynos9820_defconfig b/arch/arm64/configs/exynos9820_defconfig
 index f0f8ba8..c733f45 100644
@@ -3706,7 +3706,7 @@ index 5e7a416..28501d1 100644
 +MODULE_DESCRIPTION("EVDEV Booster in kernel");
  #endif //--CONFIG_SEC_INPUT_BOOSTER
 diff --git a/drivers/input/input_booster.c b/drivers/input/input_booster.c
-index 3ed54a1..682c238 100644
+index 3ed54a1..4099fc8 100644
 --- a/drivers/input/input_booster.c
 +++ b/drivers/input/input_booster.c
 @@ -1,61 +1,72 @@
@@ -3953,7 +3953,7 @@ index 3ed54a1..682c238 100644
 +		if (list_empty(&ib_list[dev_type])) {
 +			pr_booster("IB List(%d) Empty", dev_type);
 +			continue;
-+		}
+ 		}
 +		list_for_each_entry_rcu(ib, &ib_list[dev_type], list) {
 +			cnt++;
 +			if (ib != NULL && ib->uniq_id == uniq_id) {
@@ -3961,7 +3961,7 @@ index 3ed54a1..682c238 100644
 +				pr_booster("uniq id find :: IB Idx(%d) old(%d) new(%d)", cnt, ib->uniq_id, uniq_id);
 +				return false;
 +			}
- 		}
++		}
 +		cnt = 0;
  	}
  
@@ -4038,11 +4038,11 @@ index 3ed54a1..682c238 100644
  
 -	struct t_ib_info *target_ib = container_of(work, struct t_ib_info, ib_timeout_work[IB_HEAD].work);
 +	struct t_ib_info* target_ib = container_of(work, struct t_ib_info, ib_timeout_work[IB_HEAD].work);
- 
--	pr_booster("Press Timeout Func :::: Unique_Id(%d)", target_ib->uniq_id);
++
 +	if (!target_ib)
 +		return;
-+
+ 
+-	pr_booster("Press Timeout Func :::: Unique_Id(%d)", target_ib->uniq_id);
 +	pr_info(ITAG" Press Timeout Func :::: Unique_Id(%d) Tail_Time(%d)",
 +		target_ib->uniq_id, target_ib->ib_dt->tail_time);
  
@@ -4413,14 +4413,14 @@ index 3ed54a1..682c238 100644
 +		//Release Values inserted inside array
 +		if (isIntType) {
 +			copy_result = sscanf(token, "%d", &int_target_arr_ptr[iter]);
-+			if (!copy_result) {
++			if (copy_result != 1) {
 +				pr_err(ITAG"DTSI string value parsing fail");
 +				return -1;
 +			}
 +			pr_booster("Target_arr[%d] : %d", iter, int_target_arr_ptr[iter]);
 +		} else {
 +			copy_result = sscanf(token, "%s", &str_target_arr_ptr[iter]);
-+			if (!copy_result) {
++			if (copy_result != 1) {
 +				pr_err(ITAG"DTSI string value parsing fail");
 +				return -1;
 +			}
@@ -4476,7 +4476,7 @@ index 3ed54a1..682c238 100644
  	int i;
  
  	int ib_dt_size = sizeof(struct t_ib_device_tree);
-@@ -545,151 +702,234 @@ void input_booster_init(void)
+@@ -545,151 +702,246 @@ void input_booster_init(void)
  	int list_head_size = sizeof(struct list_head);
  	int ddr_info_size = sizeof(struct t_ddr_info);
  
@@ -4547,11 +4547,23 @@ index 3ed54a1..682c238 100644
  
 -	sscanf((of_get_property(np, "max_resource_count", NULL)), "%d", &max_resource_size);
 +// Get Needed Information from dtsi
-+	result = sscanf((of_get_property(np, "max_resource_count",
-+			NULL)), "%d", &max_resource_count);
-+	if (!result) {
-+		pr_err(ITAG"max_resource_count value parsing fail");
-+		goto out;
++	{
++		const char *max_res_str = of_get_property(np, "max_resource_count", NULL);
+ 
+-	pr_info(ITAG" resource size : %d", max_resource_size);
++		if (max_res_str == NULL) {
++			pr_err(ITAG"max_resource_count property missing");
++			goto out;
++		}
++		result = sscanf(max_res_str, "%d", &max_resource_count);
++		if (result != 1) {
++			pr_err(ITAG"max_resource_count value parsing fail");
++			goto out;
++		}
++		if (max_resource_count <= 0 || max_resource_count > MAX_RES_COUNT) {
++			pr_err(ITAG"invalid max_resource_count(%d)", max_resource_count);
++			goto out;
++		}
 +	}
 +
 +	if (of_get_property(np, "max_cluster_count", NULL))
@@ -4562,12 +4574,11 @@ index 3ed54a1..682c238 100644
 +	if (!result)
 +		max_cluster_count = 3;
  
--	pr_info(ITAG" resource size : %d", max_resource_size);
-+	pr_info(ITAG" resource size : %d, cluster count : %d",
-+		max_resource_count, max_cluster_count);
- 
 -	//qos list mem alloc
 -	qos_list = kcalloc(ABS_CNT, list_head_size * max_resource_size, GFP_KERNEL);
++	pr_info(ITAG" resource size : %d, cluster count : %d",
++		max_resource_count, max_cluster_count);
++
 +//qos list mem alloc
 +	qos_list = kzalloc(list_head_size * max_resource_count, GFP_KERNEL);
  	if (qos_list == NULL) {
@@ -4621,9 +4632,10 @@ index 3ed54a1..682c238 100644
 +	allowed_res_count = result;
 +
 +	for (i = 0; i < result; i++) {
-+		if (allowed_resources[i] >= max_resource_count) {
-+			pr_err(ITAG" allow res index(%d) exceeds over max res count",
-+				allowed_resources[i]);
++		if (allowed_resources[i] < 0 ||
++			allowed_resources[i] >= max_resource_count) {
++			pr_err(ITAG" invalid allow res index(%d), max(%d)",
++				allowed_resources[i], max_resource_count);
 +			goto out;
 +		}
 +	}
@@ -4777,7 +4789,7 @@ index 3ed54a1..682c238 100644
  		}
  
  		//Init all type of ib list.
-@@ -699,17 +939,29 @@ void input_booster_init(void)
+@@ -699,17 +951,29 @@ void input_booster_init(void)
  	}
  
  	ib_init_succeed = is_ib_init_succeed();
@@ -4809,7 +4821,7 @@ index 3ed54a1..682c238 100644
  			return;
  		}
  		if (ib_init_succeed) {
-@@ -717,14 +969,13 @@ void input_booster_init(void)
+@@ -717,14 +981,13 @@ void input_booster_init(void)
  			INIT_SYSFS_CLASS(debug_level)
  			INIT_SYSFS_CLASS(sendevent)
  
