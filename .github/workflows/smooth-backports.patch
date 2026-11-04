@@ -2860,7 +2860,7 @@ index 76a9652..102aadd 100644
 2.54.0
 
 
-From c87ea84bb49d1135e733efc35e4643abd6dc8996 Mon Sep 17 00:00:00 2001
+From 2156a970dbfb3427c212076165b38df8f46291fa Mon Sep 17 00:00:00 2001
 From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 00:18:56 +0100
 Subject: [PATCH 4/4] input: booster: refresh input booster to v2
@@ -2892,11 +2892,11 @@ Author: @Devandroid-bit.
  drivers/input/Kconfig                   |  23 +-
  drivers/input/Makefile                  |   5 +-
  drivers/input/evdev.c                   |  31 --
- drivers/input/evdev_booster.c           | 402 ++++++++++++----
- drivers/input/input_booster.c           | 616 ++++++++++++++++--------
+ drivers/input/evdev_booster.c           | 480 ++++++++++++++----
+ drivers/input/input_booster.c           | 625 ++++++++++++++++--------
  drivers/input/input_booster_lsi.c       |  70 ++-
  include/linux/input/input_booster.h     | 128 ++++-
- 8 files changed, 904 insertions(+), 373 deletions(-)
+ 8 files changed, 991 insertions(+), 373 deletions(-)
 
 diff --git a/arch/arm64/configs/exynos9820_defconfig b/arch/arm64/configs/exynos9820_defconfig
 index f0f8ba8..c733f45 100644
@@ -3031,10 +3031,10 @@ index dd225d0..5379771 100644
  }
  
 diff --git a/drivers/input/evdev_booster.c b/drivers/input/evdev_booster.c
-index 5e7a416..7157fa3 100644
+index 5e7a416..b063dbc 100644
 --- a/drivers/input/evdev_booster.c
 +++ b/drivers/input/evdev_booster.c
-@@ -1,18 +1,210 @@
+@@ -1,18 +1,225 @@
 -#ifdef CONFIG_SEC_INPUT_BOOSTER
 -int chk_next_data(struct evdev_client *dev, int idx, int input_type)
 +#define ITAG " [Evdev Booster] "
@@ -3080,9 +3080,12 @@ index 5e7a416..7157fa3 100644
 +
 +#if defined(CONFIG_SEC_INPUT_BOOSTER_HANDLER)
 +struct workqueue_struct *ib_unbound_highwq;
-+spinlock_t ib_idx_lock;
-+struct ib_event_work *ib_evt_work;
-+int ib_work_cnt;
++
++struct ib_queued_event {
++	struct work_struct work;
++	int evt_cnt;
++	struct input_value vals[];
++};
 +
 +int ib_notifier_register(struct notifier_block *nb) {
 +	/* nothing to do here */
@@ -3094,9 +3097,10 @@ index 5e7a416..7157fa3 100644
 +	return 0;
 +}
 +
-+static void evdev_ib_trigger(struct work_struct* work)
++static void evdev_ib_trigger(struct work_struct *work)
 +{
-+	struct ib_event_work *ib_work = container_of(work, struct ib_event_work, evdev_work);
++	struct ib_queued_event *ib_work =
++		container_of(work, struct ib_queued_event, work);
 +	struct ib_event_data ib_data = {0, };
 +
 +	spin_lock(&ib_ev_lock);
@@ -3104,25 +3108,36 @@ index 5e7a416..7157fa3 100644
 +	ib_data.vals = ib_work->vals;
 +	input_booster(&ib_data);
 +	spin_unlock(&ib_ev_lock);
++
++	kfree(ib_work);
 +}
 +
 +static void sec_input_boost_events(struct input_handle *handle,
-+			 const struct input_value *vals, unsigned int count) {
-+	int cur_ib_idx;
++			 const struct input_value *vals, unsigned int count)
++{
++	struct ib_queued_event *ib_work;
++	unsigned int alloc_size;
 +
-+	spin_lock(&ib_idx_lock);
-+	cur_ib_idx = ib_work_cnt++;
-+	if (ib_work_cnt >= MAX_IB_COUNT) {
-+		pr_info("[Input Booster] Ib_Work_Cnt(%d), Event_Cnt(%d)\n", ib_work_cnt, count);
-+		ib_work_cnt = 0;
++	if (!count || !vals || !ib_unbound_highwq)
++		return;
++
++	if (count > MAX_EVENT_COUNT) {
++		pr_warn_ratelimited(ITAG"event count(%u) exceeds max(%d), dropped\n",
++					count, MAX_EVENT_COUNT);
++		return;
 +	}
 +
-+	if (ib_evt_work != NULL) {
-+		ib_evt_work[cur_ib_idx].evt_cnt = count;
-+		memcpy(ib_evt_work[cur_ib_idx].vals, vals, sizeof(struct input_value) * count);
-+		queue_work(ib_unbound_highwq, &(ib_evt_work[cur_ib_idx].evdev_work));
-+	}
-+	spin_unlock(&ib_idx_lock);
++	alloc_size = sizeof(*ib_work) + count * sizeof(struct input_value);
++	ib_work = kmalloc(alloc_size, GFP_ATOMIC);
++	if (!ib_work)
++		return;
++
++	INIT_WORK(&ib_work->work, evdev_ib_trigger);
++	ib_work->evt_cnt = count;
++	memcpy(ib_work->vals, vals, count * sizeof(struct input_value));
++
++	if (!queue_work(ib_unbound_highwq, &ib_work->work))
++		kfree(ib_work);
 +}
 +
 +static void sec_input_boost_event(struct input_handle *handle,
@@ -3163,6 +3178,7 @@ index 5e7a416..7157fa3 100644
 +err1:
 +	input_unregister_handle(handle);
 +err2:
++	input_put_device(handle->dev);
 +	kfree(handle);
 +	return error;
 +}
@@ -3171,6 +3187,7 @@ index 5e7a416..7157fa3 100644
 +{
 +	input_close_device(handle);
 +	input_unregister_handle(handle);
++	input_put_device(handle->dev);
 +	kfree(handle);
 +}
 +
@@ -3213,22 +3230,20 @@ index 5e7a416..7157fa3 100644
 +
 +static int init_input_handler(void)
 +{
-+	int i;
-+
-+	ib_work_cnt = 0;
-+	spin_lock_init(&ib_idx_lock);
-+
-+	ib_evt_work = kmalloc(sizeof(struct ib_event_work) * MAX_IB_COUNT, GFP_KERNEL);
-+	if (ib_evt_work != NULL)
-+		for (i = 0; i < MAX_IB_COUNT; i++)
-+			INIT_WORK(&(ib_evt_work[i].evdev_work), evdev_ib_trigger);
++	int err;
 +
 +	ib_unbound_highwq
 +		= alloc_ordered_workqueue("ib_unbound_highwq", WQ_HIGHPRI);
 +	if (!ib_unbound_highwq)
-+		return -EPERM;
++		return -ENOMEM;
 +
-+	return input_register_handler(&ib_input_handler);
++	err = input_register_handler(&ib_input_handler);
++	if (err) {
++		destroy_workqueue(ib_unbound_highwq);
++		ib_unbound_highwq = NULL;
++	}
++
++	return err;
 +}
 +#endif
 +
@@ -3252,7 +3267,7 @@ index 5e7a416..7157fa3 100644
  			ret_val = 1;
  		break;
  	case EV_KEY:
-@@ -25,7 +217,7 @@ int chk_next_data(struct evdev_client *dev, int idx, int input_type)
+@@ -25,7 +232,7 @@ int chk_next_data(struct evdev_client *dev, int idx, int input_type)
  	return ret_val;
  }
  
@@ -3261,7 +3276,7 @@ index 5e7a416..7157fa3 100644
  {
  	int ret_val = -1;
  
-@@ -36,18 +228,18 @@ int chk_boost_on_off(struct evdev_client *dev, int idx, int dev_type)
+@@ -36,18 +243,18 @@ int chk_boost_on_off(struct evdev_client *dev, int idx, int dev_type)
  	 * Before starting input booster.
  	 */
  	if (dev_type == SPEN || dev_type == HOVER) {
@@ -3285,7 +3300,7 @@ index 5e7a416..7157fa3 100644
  		ret_val = 0;
  
  	return ret_val;
-@@ -55,15 +247,16 @@ int chk_boost_on_off(struct evdev_client *dev, int idx, int dev_type)
+@@ -55,15 +262,16 @@ int chk_boost_on_off(struct evdev_client *dev, int idx, int dev_type)
  
  /*
   * get_device_type : Define type of device for input_booster.
@@ -3306,14 +3321,15 @@ index 5e7a416..7157fa3 100644
  {
  	int i;
  	int ret_val = -1;
-@@ -72,29 +265,29 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
+@@ -72,29 +280,32 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
  	int next_idx = 0 ;
  	int target_idx = 0;
  
 -	if (dev == NULL || dev->ev_cnt > MAX_EVENTS) {
 -		pr_err("evdev client is null and exceed max event number");
 +	if (evt_cnt > MAX_EVENTS) {
-+		dev_warn_ratelimited(evbst_dev, "Exceed max event number\n");
++		pr_warn_ratelimited(ITAG"Exceed max event number(%d)\n", evt_cnt);
++		*cur_idx = evt_cnt;
  		return ret_val;
  	}
  
@@ -3343,12 +3359,14 @@ index 5e7a416..7157fa3 100644
 +			switch (vals[i].code) {
  			case BTN_TOUCH:
 -				if (!chk_next_data(dev, i, BTN_TOUCH))
-+				next_idx = i+1;
++				next_idx = i + 1;
++				if (next_idx >= evt_cnt)
++					break;
 +				if (!chk_next_data(vals, next_idx, BTN_TOUCH))
  					break;
  				dev_type = SPEN;
  				break;
-@@ -103,30 +296,35 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
+@@ -103,30 +314,35 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
  				break;
  			case KEY_BACK:
  			case KEY_HOMEPAGE:
@@ -3390,7 +3408,7 @@ index 5e7a416..7157fa3 100644
  					if (evdev_mt_slot == 1) {
  						dev_type = TOUCH;
  						uniq_slot = 1;
-@@ -134,8 +332,7 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
+@@ -134,8 +350,7 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
  						dev_type = MULTI_TOUCH;
  						uniq_slot = 2;
  					}
@@ -3400,7 +3418,7 @@ index 5e7a416..7157fa3 100644
  					if (evdev_mt_slot == 0) {
  						dev_type = TOUCH;
  						uniq_slot = 1;
-@@ -145,87 +342,87 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
+@@ -145,87 +360,98 @@ int get_device_type(struct evdev_client *dev, unsigned int *keyId, int *cur_idx,
  					}
  				}
  
@@ -3419,13 +3437,15 @@ index 5e7a416..7157fa3 100644
 -			if (!chk_next_data(dev, i, EV_KEY)) {
 +		} else if (vals[i].type == EV_MSC &&
 +					vals[i].code == MSC_SCAN) {
-+			next_idx = i++;
-+			if (!chk_next_data(vals, next_idx, EV_KEY))
++			next_idx = i + 1;
++			if (next_idx >= evt_cnt)
  				break;
 -			}
 -			next_idx = (i+1) & (dev->bufsize - 1);
++			if (!chk_next_data(vals, next_idx, EV_KEY))
++				break;
 +
-+			next_idx = i++;
++			i = next_idx;
  			target_idx = next_idx;
 -			switch (dev->buffer[next_idx].code) {
 +			switch (vals[next_idx].code) {
@@ -3508,6 +3528,15 @@ index 5e7a416..7157fa3 100644
  
 -	head = dev_head;
 -	cur_idx = (head - dev->ev_cnt) & (dev->bufsize - 1);
++	if (!ib_ev_data->vals || ib_ev_data->evt_cnt > MAX_EVENTS) {
++		pr_warn_ratelimited(ITAG"invalid event batch, cnt(%d)\n",
++					ib_ev_data->evt_cnt);
++		return;
++	}
++
++	if (!ev_unbound_wq || !ib_trigger)
++		return;
++
 +	cur_idx = 0;
 +
 +	while (cur_idx < ib_ev_data->evt_cnt) {
@@ -3525,7 +3554,7 @@ index 5e7a416..7157fa3 100644
  		if (dev_type <= NONE_TYPE_DEVICE || dev_type >= MAX_DEVICE_TYPE_NUM) {
  			continue;
  		}
-@@ -236,22 +433,59 @@ void input_booster(struct evdev_client *dev, int dev_head)
+@@ -236,22 +462,108 @@ void input_booster(struct evdev_client *dev, int dev_head)
  			evdev_mt_event[dev_type]--;
  		}
  
@@ -3550,6 +3579,11 @@ index 5e7a416..7157fa3 100644
  		trigger_cnt = (trigger_cnt == MAX_IB_COUNT) ? 0 : trigger_cnt;
  	}
 +#endif
++}
++
++static void evbst_dev_release(struct device *dev)
++{
++	kfree(dev);
  }
 +
 +static int __init ev_boost_init(void)
@@ -3561,30 +3595,74 @@ index 5e7a416..7157fa3 100644
 +	pr_info(ITAG" Input Booster Module Init End\n");
 +	spin_lock_init(&ib_ev_lock);
 +	ib_notifier_register(&ib_event_notifier);
++
 +	ev_unbound_wq =
 +		alloc_ordered_workqueue("ev_unbound_wq", WQ_HIGHPRI);
++	if (!ev_unbound_wq) {
++		pr_err(ITAG" ev_unbound_wq alloc fail\n");
++		err = -ENOMEM;
++		goto err_notifier;
++	}
 +
-+	evbst_dev = kzalloc(sizeof(struct device), GFP_KERNEL);
++	evbst_dev = kzalloc(sizeof(*evbst_dev), GFP_KERNEL);
++	if (!evbst_dev) {
++		pr_err(ITAG" evbst_dev alloc fail\n");
++		err = -ENOMEM;
++		goto err_wq;
++	}
 +	dev_set_name(evbst_dev, "evdev_booster_dev");
-+	evbst_dev->release = NULL;
++	evbst_dev->release = evbst_dev_release;
++
 +	err = device_register(evbst_dev);
-+	if (err)
++	if (err) {
 +		pr_err(ITAG" evdev device register failed\n");
++		put_device(evbst_dev);
++		evbst_dev = NULL;
++		goto err_wq;
++	}
 +
 +#if defined(CONFIG_SEC_INPUT_BOOSTER_HANDLER)
 +	err = init_input_handler();
-+	if (err)
++	if (err) {
 +		pr_err(ITAG" input handler fail\n");
++		goto err_dev;
++	}
 +#endif
 +
 +	return 0;
++
++#if defined(CONFIG_SEC_INPUT_BOOSTER_HANDLER)
++err_dev:
++	device_unregister(evbst_dev);
++	evbst_dev = NULL;
++#endif
++err_wq:
++	destroy_workqueue(ev_unbound_wq);
++	ev_unbound_wq = NULL;
++err_notifier:
++	ib_notifier_unregister(&ib_event_notifier);
++	input_booster_exit();
++	return err;
 +}
 +
 +static void __exit ev_boost_exit(void)
 +{
++#if defined(CONFIG_SEC_INPUT_BOOSTER_HANDLER)
++	input_unregister_handler(&ib_input_handler);
++	if (ib_unbound_highwq) {
++		destroy_workqueue(ib_unbound_highwq);
++		ib_unbound_highwq = NULL;
++	}
++#endif
 +	ib_notifier_unregister(&ib_event_notifier);
-+	device_unregister(evbst_dev);
-+	kfree(evbst_dev);
++	if (ev_unbound_wq) {
++		destroy_workqueue(ev_unbound_wq);
++		ev_unbound_wq = NULL;
++	}
++	if (evbst_dev) {
++		device_unregister(evbst_dev);
++		evbst_dev = NULL;
++	}
 +	input_booster_exit();
 +}
 +
@@ -3596,7 +3674,7 @@ index 5e7a416..7157fa3 100644
 +MODULE_DESCRIPTION("EVDEV Booster in kernel");
  #endif //--CONFIG_SEC_INPUT_BOOSTER
 diff --git a/drivers/input/input_booster.c b/drivers/input/input_booster.c
-index 3ed54a1..e3a45fb 100644
+index 3ed54a1..48f07b0 100644
 --- a/drivers/input/input_booster.c
 +++ b/drivers/input/input_booster.c
 @@ -1,61 +1,74 @@
@@ -3724,7 +3802,7 @@ index 3ed54a1..e3a45fb 100644
 -		for (res_type = 0; res_type < max_resource_size; res_type++) {
 -			if (ib != NULL && ib->ib_dt->res[res_type].head_value != 0) {
 +		for (res_type = 0; res_type < allowed_res_count; res_type++) {
-+			if (allowed_resources[res_type] > max_resource_count) {
++			if (allowed_resources[res_type] >= max_resource_count) {
 +				pr_err(ITAG" allow res num(%d) exceeds over max res count",
 +					allowed_resources[res_type]);
 +				continue;
@@ -4237,7 +4315,7 @@ index 3ed54a1..e3a45fb 100644
  	&dev_attr_head.attr,
  	&dev_attr_tail.attr,
  	&dev_attr_level.attr,
-@@ -497,39 +584,92 @@ struct attribute_group dvfs_attr_group = {
+@@ -497,39 +584,96 @@ struct attribute_group dvfs_attr_group = {
  	.attrs = dvfs_attributes,
  };
  
@@ -4323,6 +4401,10 @@ index 3ed54a1..e3a45fb 100644
  void input_booster_exit(void)
  {
 -	int i = 0;
++	if (ib_handle_highwq) {
++		destroy_workqueue(ib_handle_highwq);
++		ib_handle_highwq = NULL;
++	}
  
  	kfree(ib_trigger);
  	kfree(ib_device_trees);
@@ -4337,7 +4419,7 @@ index 3ed54a1..e3a45fb 100644
  }
  
  // ********** Init Booster ********** //
-@@ -537,7 +677,7 @@ void input_booster_exit(void)
+@@ -537,7 +681,7 @@ void input_booster_exit(void)
  void input_booster_init(void)
  {
  	// ********** Load Frequency data from DTSI **********
@@ -4346,7 +4428,7 @@ index 3ed54a1..e3a45fb 100644
  	int i;
  
  	int ib_dt_size = sizeof(struct t_ib_device_tree);
-@@ -545,131 +685,193 @@ void input_booster_init(void)
+@@ -545,131 +689,193 @@ void input_booster_init(void)
  	int list_head_size = sizeof(struct list_head);
  	int ddr_info_size = sizeof(struct t_ddr_info);
  
@@ -4427,8 +4509,7 @@ index 3ed54a1..e3a45fb 100644
 +		pr_err(ITAG"max_resource_count value parsing fail");
 +		goto out;
 +	}
- 
--	pr_info(ITAG" resource size : %d", max_resource_size);
++
 +	if (of_get_property(np, "max_cluster_count", NULL))
 +		result = sscanf((of_get_property(np, "max_cluster_count",
 +				NULL)), "%d", &max_cluster_count);
@@ -4437,11 +4518,12 @@ index 3ed54a1..e3a45fb 100644
 +	if (!result)
 +		max_cluster_count = 3;
  
--	//qos list mem alloc
--	qos_list = kcalloc(ABS_CNT, list_head_size * max_resource_size, GFP_KERNEL);
+-	pr_info(ITAG" resource size : %d", max_resource_size);
 +	pr_info(ITAG" resource size : %d, cluster count : %d",
 +		max_resource_count, max_cluster_count);
-+
+ 
+-	//qos list mem alloc
+-	qos_list = kcalloc(ABS_CNT, list_head_size * max_resource_size, GFP_KERNEL);
 +//qos list mem alloc
 +	qos_list = kzalloc(list_head_size * max_resource_count, GFP_KERNEL);
  	if (qos_list == NULL) {
@@ -4595,7 +4677,7 @@ index 3ed54a1..e3a45fb 100644
  				}
  			}
  
-@@ -699,17 +901,24 @@ void input_booster_init(void)
+@@ -699,17 +905,29 @@ void input_booster_init(void)
  	}
  
  	ib_init_succeed = is_ib_init_succeed();
@@ -4603,9 +4685,14 @@ index 3ed54a1..e3a45fb 100644
 +	if (ib_init_succeed)
 +		ib_init_succeed = input_booster_init_vendor();
 +
-+	if (ib_init_succeed)
-+		ib_handle_highwq = alloc_workqueue("ib_unbound_high_wq", WQ_UNBOUND | WQ_HIGHPRI,
-+					 MAX_IB_COUNT);
++	if (ib_init_succeed) {
++		ib_handle_highwq = alloc_workqueue("ib_unbound_high_wq",
++					 WQ_UNBOUND | WQ_HIGHPRI, MAX_IB_COUNT);
++		if (!ib_handle_highwq) {
++			pr_err(ITAG" ib_handle_highwq alloc fail");
++			ib_init_succeed = 0;
++		}
++	}
  
  out:
  	// ********** Initialize Sysfs **********
@@ -4622,7 +4709,7 @@ index 3ed54a1..e3a45fb 100644
  			return;
  		}
  		if (ib_init_succeed) {
-@@ -717,14 +926,13 @@ void input_booster_init(void)
+@@ -717,14 +935,13 @@ void input_booster_init(void)
  			INIT_SYSFS_CLASS(debug_level)
  			INIT_SYSFS_CLASS(sendevent)
  
