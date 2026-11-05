@@ -1,0 +1,115 @@
+name: Apply backports (zram recompression, proactive compaction, F2FS ATGC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to patch"
+        required: true
+        default: "devandroid-droidspaces-mglru-smooth-backports"
+      target_branch:
+        description: "Branch to create or update"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+      patch_file:
+        description: "Patch path in the repository"
+        required: true
+        default: ".github/workflows/backports-ack.patch"
+      patch_url:
+        description: "Optional HTTPS URL to download the patch (overrides patch_file)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: backports-ack-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Checkout workflow ref for patch fallback
+        if: ${{ inputs.patch_url == '' && hashFiles(inputs.patch_file) == '' }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: dispatch-ref
+          fetch-depth: 1
+
+      - name: Resolve patch
+        env:
+          PATCH_FILE: ${{ inputs.patch_file }}
+          PATCH_URL: ${{ inputs.patch_url }}
+        run: |
+          set -euo pipefail
+          PATCH=""
+
+          if [ -n "$PATCH_URL" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL "$PATCH_URL" -o /tmp/backports-ack.patch
+            PATCH=/tmp/backports-ack.patch
+          elif [ -f "$PATCH_FILE" ]; then
+            PATCH="$PATCH_FILE"
+          elif [ -f "dispatch-ref/$PATCH_FILE" ]; then
+            cp "dispatch-ref/$PATCH_FILE" /tmp/backports-ack.patch
+            PATCH=/tmp/backports-ack.patch
+          else
+            echo "::error::Patch not found at '$PATCH_FILE' (or set patch_url)."
+            exit 1
+          fi
+
+          rm -rf dispatch-ref
+          EXPECTED_SHA256="5df0e12c69bca5c413c987d1540c8baa4b19ed76a79c16b947288a4132ae5160"
+          ACTUAL_SHA256="$(sha256sum "$PATCH" | cut -d' ' -f1)"
+          test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
+          echo "PATCH_PATH=$PATCH" >> "$GITHUB_ENV"
+          ls -lh "$PATCH"
+
+      - name: Apply patches and verify
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BASE_SHA=$(git rev-parse HEAD)
+          git checkout -B "$TARGET_BRANCH"
+
+          git am --keep-cr "$PATCH_PATH"
+
+          test "$(git rev-list --count "$BASE_SHA..HEAD")" -eq 3
+          test "$(git log "$BASE_SHA..HEAD" --format=%B \
+            | grep -c '^Author: @Devandroid-bit\.$')" -eq 3
+
+          for CFG in d1 d1xks d2s d2x d2xks; do
+            grep -q '^CONFIG_ZRAM_MULTI_COMP=y' "arch/arm64/configs/$CFG.config"
+          done
+          grep -q 'ZRAM_MULTI_COMP' drivers/block/zram/Kconfig
+          grep -q 'compaction_proactiveness' kernel/sysctl.c
+          grep -q 'GC_AT' fs/f2fs/segment.h
+          grep -q 'atgc_candidate_ratio' fs/f2fs/sysfs.c
+
+          git log --oneline "$BASE_SHA..HEAD"
+
+      - name: Push target branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || true
+          git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "### Backports applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits:" >> "$GITHUB_STEP_SUMMARY"
+          git log --format='- `%h` %s' -3 >> "$GITHUB_STEP_SUMMARY"
+          echo "- Patch SHA256: \`$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)\`" >> "$GITHUB_STEP_SUMMARY"

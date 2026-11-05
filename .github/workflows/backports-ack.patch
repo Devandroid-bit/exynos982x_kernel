@@ -1,0 +1,2217 @@
+From d834d9748d1649f0f8240649865ad3048660a19c Mon Sep 17 00:00:00 2001
+From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 08:37:35 +0100
+Subject: [PATCH 1/3] BACKPORT: mm: proactive compaction
+
+Backport proactive compaction and its follow-up fixes to the
+Exynos9820 4.14 tree.
+
+Backported from: Galaxy S24 6.1 (S921BXXSGDZG1), based on
+upstream v5.9 commit facdaa917c4d5a376d09d25865f5a863f906234a
+("mm: proactive compaction").
+
+Included upstream fixes:
+- d34c0a7599ea ("mm: use unsigned types for fragmentation score")
+- 40d7e2032007 ("mm/compaction: correct deferral logic for proactive compaction")
+- e1e92bfa3825 ("mm: compaction: optimize proactive compaction deferrals")
+- 1bfb7684db12 ("mm: compaction: count the migration scanned pages events
+  for proactive compaction")
+
+Adapted for 4.14:
+- kcompactd already lives in mm/compaction.c; use the local
+  compact_zone(zone, cc) and __compact_finished(zone, cc) signatures.
+- mm/vmscan.c is not touched, so the MGLRU backport is preserved.
+- the sysctl defaults to 20 and can be disabled by writing 0 to
+  /proc/sys/vm/compaction_proactiveness.
+
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Author: @Devandroid-bit.
+---
+ include/linux/compaction.h |   2 +
+ kernel/sysctl.c            |   9 ++
+ mm/compaction.c            | 204 ++++++++++++++++++++++++++++++++++++-
+ mm/internal.h              |   1 +
+ mm/vmstat.c                |  18 ++++
+ 5 files changed, 229 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/compaction.h b/include/linux/compaction.h
+index 68250a5..2833b4b 100644
+--- a/include/linux/compaction.h
++++ b/include/linux/compaction.h
+@@ -85,6 +85,7 @@ static inline unsigned long compact_gap(unsigned int order)
+ 
+ #ifdef CONFIG_COMPACTION
+ extern int sysctl_compact_memory;
++extern unsigned int sysctl_compaction_proactiveness;
+ extern int sysctl_compaction_handler(struct ctl_table *table, int write,
+ 			void __user *buffer, size_t *length, loff_t *ppos);
+ extern int sysctl_extfrag_threshold;
+@@ -92,6 +93,7 @@ extern int sysctl_extfrag_handler(struct ctl_table *table, int write,
+ 			void __user *buffer, size_t *length, loff_t *ppos);
+ extern int sysctl_compact_unevictable_allowed;
+ 
++extern unsigned int extfrag_for_order(struct zone *zone, unsigned int order);
+ extern int fragmentation_index(struct zone *zone, unsigned int order);
+ extern enum compact_result try_to_compact_pages(gfp_t gfp_mask,
+ 		unsigned int order, unsigned int alloc_flags,
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 2a14e45..2c7b238 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -1497,6 +1497,15 @@ static struct ctl_table vm_table[] = {
+ 		.mode		= 0200,
+ 		.proc_handler	= sysctl_compaction_handler,
+ 	},
++	{
++		.procname	= "compaction_proactiveness",
++		.data		= &sysctl_compaction_proactiveness,
++		.maxlen		= sizeof(sysctl_compaction_proactiveness),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one_hundred,
++	},
+ 	{
+ 		.procname	= "extfrag_threshold",
+ 		.data		= &sysctl_extfrag_threshold,
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 07728fe..a36bacf 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -21,6 +21,8 @@
+ #include <linux/kasan.h>
+ #include <linux/kthread.h>
+ #include <linux/freezer.h>
++#include <linux/jiffies.h>
++#include <linux/math64.h>
+ #include <linux/page_owner.h>
+ #include <linux/psi.h>
+ #include "internal.h"
+@@ -50,6 +52,24 @@ static inline void count_compact_events(enum vm_event_item item, long delta)
+ #define pageblock_start_pfn(pfn)	block_start_pfn(pfn, pageblock_order)
+ #define pageblock_end_pfn(pfn)		block_end_pfn(pfn, pageblock_order)
+ 
++/*
++ * Fragmentation score check interval for proactive compaction purposes.
++ */
++static const unsigned int HPAGE_FRAG_CHECK_INTERVAL_MSEC = 500;
++
++/*
++ * Page order with-respect-to which proactive compaction
++ * calculates external fragmentation, which is used as
++ * the "fragmentation score" of a node/zone.
++ */
++#if defined CONFIG_TRANSPARENT_HUGEPAGE
++#define COMPACTION_HPAGE_ORDER	HPAGE_PMD_ORDER
++#elif defined CONFIG_HUGETLBFS
++#define COMPACTION_HPAGE_ORDER	HUGETLB_PAGE_ORDER
++#else
++#define COMPACTION_HPAGE_ORDER	(PMD_SHIFT - PAGE_SHIFT)
++#endif
++
+ static unsigned long release_freepages(struct list_head *freelist)
+ {
+ 	struct page *page, *next;
+@@ -1287,6 +1307,84 @@ static inline bool is_via_compact_memory(int order)
+ 	return order == -1;
+ }
+ 
++static bool kswapd_is_running(pg_data_t *pgdat)
++{
++	return pgdat->kswapd && (pgdat->kswapd->state == TASK_RUNNING);
++}
++
++/*
++ * A zone's fragmentation score is the external fragmentation wrt to the
++ * COMPACTION_HPAGE_ORDER. It returns a value in the range [0, 100].
++ */
++static unsigned int fragmentation_score_zone(struct zone *zone)
++{
++	return extfrag_for_order(zone, COMPACTION_HPAGE_ORDER);
++}
++
++/*
++ * A weighted zone's fragmentation score is the external fragmentation
++ * wrt to the COMPACTION_HPAGE_ORDER scaled by the zone's size. It
++ * returns a value in the range [0, 100].
++ *
++ * The scaling factor ensures that proactive compaction focuses on larger
++ * zones like ZONE_NORMAL, rather than smaller, specialized zones like
++ * ZONE_DMA32. For smaller zones, the score value remains close to zero,
++ * and thus never exceeds the high threshold for proactive compaction.
++ */
++static unsigned int fragmentation_score_zone_weighted(struct zone *zone)
++{
++	unsigned long score;
++
++	score = zone->present_pages * fragmentation_score_zone(zone);
++	return div64_ul(score, zone->zone_pgdat->node_present_pages + 1);
++}
++
++/*
++ * The per-node proactive (background) compaction process is started by its
++ * corresponding kcompactd thread when the node's fragmentation score
++ * exceeds the high threshold. The compaction process remains active till
++ * the node's score falls below the low threshold, or one of the back-off
++ * conditions is met.
++ */
++static unsigned int fragmentation_score_node(pg_data_t *pgdat)
++{
++	unsigned int score = 0;
++	int zoneid;
++
++	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
++		struct zone *zone;
++
++		zone = &pgdat->node_zones[zoneid];
++		score += fragmentation_score_zone_weighted(zone);
++	}
++
++	return score;
++}
++
++static unsigned int fragmentation_score_wmark(pg_data_t *pgdat, bool low)
++{
++	unsigned int wmark_low;
++
++	/*
++	 * Cap the low watermak to avoid excessive compaction
++	 * activity in case a user sets the proactivess tunable
++	 * close to 100 (maximum).
++	 */
++	wmark_low = max(100U - sysctl_compaction_proactiveness, 5U);
++	return low ? wmark_low : min(wmark_low + 10, 100U);
++}
++
++static bool should_proactive_compact_node(pg_data_t *pgdat)
++{
++	unsigned int wmark_high;
++
++	if (!sysctl_compaction_proactiveness || kswapd_is_running(pgdat))
++		return false;
++
++	wmark_high = fragmentation_score_wmark(pgdat, false);
++	return fragmentation_score_node(pgdat) > wmark_high;
++}
++
+ static enum compact_result __compact_finished(struct zone *zone,
+ 						struct compact_control *cc)
+ {
+@@ -1316,6 +1414,22 @@ static enum compact_result __compact_finished(struct zone *zone,
+ 			return COMPACT_PARTIAL_SKIPPED;
+ 	}
+ 
++	if (cc->proactive_compaction) {
++		unsigned int score, wmark_low;
++		pg_data_t *pgdat = zone->zone_pgdat;
++
++		if (kswapd_is_running(pgdat))
++			return COMPACT_PARTIAL_SKIPPED;
++
++		score = fragmentation_score_zone(zone);
++		wmark_low = fragmentation_score_wmark(pgdat, true);
++
++		if (score > wmark_low)
++			return COMPACT_CONTINUE;
++		else
++			return COMPACT_SUCCESS;
++	}
++
+ 	if (is_via_compact_memory(cc->order))
+ 		return COMPACT_CONTINUE;
+ 
+@@ -1781,6 +1895,47 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
+ }
+ 
+ 
++/*
++ * Compact all zones within a node till each zone's fragmentation score
++ * reaches within proactive compaction thresholds (as determined by the
++ * proactiveness tunable).
++ *
++ * It is possible that the function returns before reaching score targets
++ * due to various back-off conditions, such as, contention on per-node or
++ * per-zone locks.
++ */
++static void proactive_compact_node(pg_data_t *pgdat)
++{
++	int zoneid;
++	struct zone *zone;
++	struct compact_control cc = {
++		.order = -1,
++		.mode = MIGRATE_SYNC_LIGHT,
++		.ignore_skip_hint = true,
++		.whole_zone = true,
++		.gfp_mask = GFP_KERNEL,
++		.proactive_compaction = true,
++	};
++
++	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
++		zone = &pgdat->node_zones[zoneid];
++		if (!populated_zone(zone))
++			continue;
++
++		cc.zone = zone;
++
++		compact_zone(zone, &cc);
++
++		count_compact_events(KCOMPACTD_MIGRATE_SCANNED,
++				     cc.total_migrate_scanned);
++		count_compact_events(KCOMPACTD_FREE_SCANNED,
++				     cc.total_free_scanned);
++
++		VM_BUG_ON(!list_empty(&cc.freepages));
++		VM_BUG_ON(!list_empty(&cc.migratepages));
++	}
++}
++
+ /* Compact all zones within a node */
+ static void compact_node(int nid)
+ {
+@@ -1826,6 +1981,13 @@ static void compact_nodes(void)
+ /* The written value is actually unused, all memory is compacted */
+ int sysctl_compact_memory;
+ 
++/*
++ * Tunable for proactive compaction. It determines how
++ * aggressively the kernel should compact memory in the
++ * background. It takes values in the range [0, 100].
++ */
++unsigned int __read_mostly sysctl_compaction_proactiveness = 20;
++
+ /*
+  * This is the entry point for compacting all nodes via
+  * /proc/sys/vm/compact_memory
+@@ -2005,6 +2167,8 @@ static int kcompactd(void *p)
+ {
+ 	pg_data_t *pgdat = (pg_data_t*)p;
+ 	struct task_struct *tsk = current;
++	long default_timeout = msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC);
++	long timeout = default_timeout;
+ 
+ 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
+ 
+@@ -2020,12 +2184,42 @@ static int kcompactd(void *p)
+ 		unsigned long pflags;
+ 
+ 		trace_mm_compaction_kcompactd_sleep(pgdat->node_id);
+-		wait_event_freezable(pgdat->kcompactd_wait,
+-				kcompactd_work_requested(pgdat));
++		if (wait_event_freezable_timeout(pgdat->kcompactd_wait,
++			kcompactd_work_requested(pgdat), timeout)) {
++
++			psi_memstall_enter(&pflags);
++			kcompactd_do_work(pgdat);
++			psi_memstall_leave(&pflags);
++			/*
++			 * Reset the timeout value. The defer timeout from
++			 * proactive compaction is lost here but that is fine
++			 * as the condition of the zone changing substantionally
++			 * then carrying on with the previous defer interval is
++			 * not useful.
++			 */
++			timeout = default_timeout;
++			continue;
++		}
+ 
+-		psi_memstall_enter(&pflags);
+-		kcompactd_do_work(pgdat);
+-		psi_memstall_leave(&pflags);
++		/*
++		 * Start the proactive work with default timeout. Based
++		 * on the fragmentation score, this timeout is updated.
++		 */
++		timeout = default_timeout;
++		if (should_proactive_compact_node(pgdat)) {
++			unsigned int prev_score, score;
++
++			prev_score = fragmentation_score_node(pgdat);
++			proactive_compact_node(pgdat);
++			score = fragmentation_score_node(pgdat);
++			/*
++			 * Defer proactive compaction if the fragmentation
++			 * score did not go down i.e. no progress made.
++			 */
++			if (unlikely(score >= prev_score))
++				timeout =
++				   default_timeout << COMPACT_MAX_DEFER_SHIFT;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/mm/internal.h b/mm/internal.h
+index f3bf833..e7d30cc 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -200,6 +200,7 @@ struct compact_control {
+ 	bool ignore_skip_hint;		/* Scan blocks even if marked skip */
+ 	bool ignore_block_suitable;	/* Scan blocks considered unsuitable */
+ 	bool direct_compaction;		/* False from kcompactd or /proc/... */
++	bool proactive_compaction;	/* kcompactd proactive compaction */
+ 	bool whole_zone;		/* Whole zone should/has been scanned */
+ 	bool contended;			/* Signal lock or sched contention */
+ 	bool finishing_block;		/* Finishing current pageblock */
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 9c5e5aa..4d36010 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1002,6 +1002,24 @@ static int __fragmentation_index(unsigned int order, struct contig_page_info *in
+ 	return 1000 - div_u64( (1000+(div_u64(info->free_pages * 1000ULL, requested))), info->free_blocks_total);
+ }
+ 
++/*
++ * Calculates external fragmentation within a zone wrt the given order.
++ * It is defined as the percentage of pages found in blocks of size
++ * less than 1 << order. It returns values in range [0, 100].
++ */
++unsigned int extfrag_for_order(struct zone *zone, unsigned int order)
++{
++	struct contig_page_info info;
++
++	fill_contig_page_info(zone, order, &info);
++	if (info.free_pages == 0)
++		return 0;
++
++	return div_u64((info.free_pages -
++			(info.free_blocks_suitable << order)) * 100,
++			info.free_pages);
++}
++
+ /* Same as __fragmentation index but allocs contig_page_info on stack */
+ int fragmentation_index(struct zone *zone, unsigned int order)
+ {
+-- 
+2.54.0
+
+
+From 7e858dc6cfc1363c630f8d08a622a38e2f170946 Mon Sep 17 00:00:00 2001
+From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 09:09:18 +0100
+Subject: [PATCH 2/3] BACKPORT: zram: support multiple compression streams
+
+Backport the zram multi-compression feature to the Exynos9820 4.14
+tree. A zram device can now have one primary and up to three secondary
+compression algorithms, configured through recomp_algorithm. Existing
+pages can be recompressed in place with the recompress attribute
+(type=idle|huge|huge_idle, optional threshold and algo), and the
+per-page compression priority is tracked in the zram table flags.
+
+Adapted for the Samsung 4.14 zram driver:
+- keep ZRAM_FLAG_SHIFT at 24 and store the priority in two spare flag
+  bits after ZRAM_LRU;
+- preserve the Samsung LRU/idle writeback state when recompressing an
+  object instead of calling zram_free_page();
+- do not write recompressed objects to the compressed backing device,
+  because its on-disk header has no room for the compression priority;
+  such objects stay in zsmalloc;
+- add zs_lookup_class_index() from the upstream series.
+
+CONFIG_ZRAM_MULTI_COMP is enabled in the d1, d1xks, d2s, d2x and d2xks
+configurations. No new option is needed in exynos9820_defconfig because
+the device fragments are merged after it.
+
+Backported from: mainline v6.2 zram multi-compression series, also
+present in Google ACK android15-6.6 and android16-6.12; not present in
+Galaxy S24 6.1 (S921BXXSGDZG1).
+
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Author: @Devandroid-bit.
+---
+ arch/arm64/configs/d1.config    |   3 +
+ arch/arm64/configs/d1xks.config |   3 +
+ arch/arm64/configs/d2s.config   |   3 +
+ arch/arm64/configs/d2x.config   |   3 +
+ arch/arm64/configs/d2xks.config |   3 +
+ drivers/block/zram/Kconfig      |  11 +
+ drivers/block/zram/zram_drv.c   | 632 ++++++++++++++++++++++++++++----
+ drivers/block/zram/zram_drv.h   |  15 +-
+ include/linux/zsmalloc.h        |   1 +
+ mm/zsmalloc.c                   |  10 +
+ 10 files changed, 612 insertions(+), 72 deletions(-)
+
+diff --git a/arch/arm64/configs/d1.config b/arch/arm64/configs/d1.config
+index 09d708c..06da6bc 100644
+--- a/arch/arm64/configs/d1.config
++++ b/arch/arm64/configs/d1.config
+@@ -78,3 +78,6 @@ CONFIG_SEC_SYSUP=y
+ # Multi-Gen LRU
+ CONFIG_LRU_GEN=y
+ CONFIG_LRU_GEN_ENABLED=y
++
++# ZRAM multi-compression support
++CONFIG_ZRAM_MULTI_COMP=y
+diff --git a/arch/arm64/configs/d1xks.config b/arch/arm64/configs/d1xks.config
+index 6345475..a8e03bf 100644
+--- a/arch/arm64/configs/d1xks.config
++++ b/arch/arm64/configs/d1xks.config
+@@ -93,3 +93,6 @@ CONFIG_WLAN_REGION_CODE=200
+ # Multi-Gen LRU
+ CONFIG_LRU_GEN=y
+ CONFIG_LRU_GEN_ENABLED=y
++
++# ZRAM multi-compression support
++CONFIG_ZRAM_MULTI_COMP=y
+diff --git a/arch/arm64/configs/d2s.config b/arch/arm64/configs/d2s.config
+index f75e802..079e9fa 100644
+--- a/arch/arm64/configs/d2s.config
++++ b/arch/arm64/configs/d2s.config
+@@ -78,3 +78,6 @@ CONFIG_SEC_SYSUP=y
+ # Multi-Gen LRU
+ CONFIG_LRU_GEN=y
+ CONFIG_LRU_GEN_ENABLED=y
++
++# ZRAM multi-compression support
++CONFIG_ZRAM_MULTI_COMP=y
+diff --git a/arch/arm64/configs/d2x.config b/arch/arm64/configs/d2x.config
+index f901ce4..483f169 100644
+--- a/arch/arm64/configs/d2x.config
++++ b/arch/arm64/configs/d2x.config
+@@ -90,3 +90,6 @@ CONFIG_MUIC_UART_SWITCH=y
+ # Multi-Gen LRU
+ CONFIG_LRU_GEN=y
+ CONFIG_LRU_GEN_ENABLED=y
++
++# ZRAM multi-compression support
++CONFIG_ZRAM_MULTI_COMP=y
+diff --git a/arch/arm64/configs/d2xks.config b/arch/arm64/configs/d2xks.config
+index b05539f..9108b86 100644
+--- a/arch/arm64/configs/d2xks.config
++++ b/arch/arm64/configs/d2xks.config
+@@ -90,3 +90,6 @@ CONFIG_MUIC_UART_SWITCH=y
+ # Multi-Gen LRU
+ CONFIG_LRU_GEN=y
+ CONFIG_LRU_GEN_ENABLED=y
++
++# ZRAM multi-compression support
++CONFIG_ZRAM_MULTI_COMP=y
+diff --git a/drivers/block/zram/Kconfig b/drivers/block/zram/Kconfig
+index 553d5f0..ba62c7b 100644
+--- a/drivers/block/zram/Kconfig
++++ b/drivers/block/zram/Kconfig
+@@ -30,6 +30,17 @@ config ZRAM_WRITEBACK
+ 
+ 	 See Documentation/blockdev/zram.txt for more information.
+ 
++config ZRAM_MULTI_COMP
++	bool "Enable multiple compression streams"
++	depends on ZRAM
++	help
++	  This feature allows to setup a list of compression algorithms
++	  for the device. A page can be compressed with a secondary
++	  algorithm to save more memory. Apart from the default
++	  algorithm, up to 3 secondary algorithms can be configured.
++
++	  See Documentation/blockdev/zram.txt for more information.
++
+ config ZRAM_MEMORY_TRACKING
+ 	bool "Track zRam block status"
+ 	depends on ZRAM && DEBUG_FS
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index ffa1f14..b98daa5 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -174,6 +174,25 @@ static inline bool is_partial_io(struct bio_vec *bvec)
+ }
+ #endif
+ 
++static void zram_set_priority(struct zram *zram, u32 index, u32 prio)
++{
++	unsigned long flags;
++
++	prio &= ZRAM_COMP_PRIORITY_MASK;
++	flags = zram->table[index].flags & ~(ZRAM_COMP_PRIORITY_MASK <<
++					     ZRAM_COMP_PRIORITY_BIT1);
++	zram->table[index].flags = flags |
++		(prio << ZRAM_COMP_PRIORITY_BIT1);
++}
++
++static u32 zram_get_priority(struct zram *zram, u32 index)
++{
++	unsigned long flags = zram->table[index].flags >>
++		ZRAM_COMP_PRIORITY_BIT1;
++
++	return flags & ZRAM_COMP_PRIORITY_MASK;
++}
++
+ /*
+  * Check if request is within bounds and aligned on zram logical blocks.
+  */
+@@ -1162,6 +1181,17 @@ static int zram_writeback_fill_page(struct zram *zram, u32 index,
+ 		zram_slot_unlock(zram, index);
+ 		return 0;
+ 	}
++
++	/*
++	 * The compressed writeback header has no room for the compression
++	 * priority, so keep recompressed objects in memory. Restoring such an
++	 * object from the backing device would otherwise decompress it with
++	 * the wrong algorithm.
++	 */
++	if (zram_get_priority(zram, index)) {
++		zram_slot_unlock(zram, index);
++		return 0;
++	}
+ 	size = zram_get_obj_size(zram, index);
+ 	if (size != PAGE_SIZE)
+ 		header_sz = sizeof(struct zram_wb_header);
+@@ -1942,10 +1972,10 @@ static void zram_handle_comp_page(struct work_struct *work)
+ 	BUG_ON(zhdr->size != size);
+ 
+ 	dst = kmap_atomic(dst_page);
+-	zstrm = zcomp_stream_get(zram->comp);
++	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
+ 	ret = zcomp_decompress(zstrm,
+ 		src + offset + sizeof(struct zram_wb_header), size, dst);
+-	zcomp_stream_put(zram->comp);
++	zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+ 	if (ret) {
+ 		pr_err("%s Decompression failed! err=%d offset=%u size=%u addr=%p\n",
+ 			__func__, ret, offset, size, src);
+@@ -2099,15 +2129,18 @@ static ssize_t read_block_state(struct file *file, char __user *buf,
+ 
+ 		ts = ktime_to_timespec64(zram->table[index].ac_time);
+ 		copied = snprintf(kbuf + written, count,
+-			"%12zd %12lld.%06lu %c%c%c%c\n",
++			"%12zd %12lld.%06lu %c%c%c%c%c%c\n",
+ 			index, (s64)ts.tv_sec,
+ 			ts.tv_nsec / NSEC_PER_USEC,
+ 			zram_test_flag(zram, index, ZRAM_SAME) ? 's' : '.',
+ 			zram_test_flag(zram, index, ZRAM_WB) ? 'w' : '.',
+ 			zram_test_flag(zram, index, ZRAM_HUGE) ? 'h' : '.',
+-			zram_test_flag(zram, index, ZRAM_IDLE) ? 'i' : '.');
++			zram_test_flag(zram, index, ZRAM_IDLE) ? 'i' : '.',
++			zram_get_priority(zram, index) ? 'r' : '.',
++			zram_test_flag(zram, index,
++				       ZRAM_INCOMPRESSIBLE) ? 'n' : '.');
+ 
+-		if (count < copied) {
++		if (count <= copied) {
+ 			zram_slot_unlock(zram, index);
+ 			break;
+ 		}
+@@ -2182,43 +2215,166 @@ static ssize_t max_comp_streams_store(struct device *dev,
+ static ssize_t comp_algorithm_show(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+ {
+-	size_t sz;
+ 	struct zram *zram = dev_to_zram(dev);
++	size_t sz;
+ 
+ 	down_read(&zram->init_lock);
+-	sz = zcomp_available_show(zram->compressor, buf);
++	sz = zcomp_available_show(zram->comp_algs[ZRAM_PRIMARY_COMP], buf);
+ 	up_read(&zram->init_lock);
+ 
+ 	return sz;
+ }
+ 
+-static ssize_t comp_algorithm_store(struct device *dev,
+-		struct device_attribute *attr, const char *buf, size_t len)
++static int comp_algorithm_set(struct zram *zram, u32 prio, const char *algo)
++{
++	char *new_algo;
++
++	new_algo = kstrdup(algo, GFP_KERNEL);
++	if (!new_algo)
++		return -ENOMEM;
++
++	if (zram->comp_algs[prio] && zram->comp_algs[prio] != default_compressor)
++		kfree(zram->comp_algs[prio]);
++	zram->comp_algs[prio] = new_algo;
++
++	return 0;
++}
++
++static ssize_t __comp_algorithm_store(struct device *dev, const char *buf,
++				      size_t len, u32 prio)
+ {
+ 	struct zram *zram = dev_to_zram(dev);
+-	char compressor[ARRAY_SIZE(zram->compressor)];
++	char *compressor;
+ 	size_t sz;
++	int ret;
++
++	compressor = kstrdup(buf, GFP_KERNEL);
++	if (!compressor)
++		return -ENOMEM;
+ 
+-	strlcpy(compressor, buf, sizeof(compressor));
+ 	/* ignore trailing newline */
+ 	sz = strlen(compressor);
+ 	if (sz > 0 && compressor[sz - 1] == '\n')
+ 		compressor[sz - 1] = 0x00;
+ 
+-	if (!zcomp_available_algorithm(compressor))
++	if (!zcomp_available_algorithm(compressor)) {
++		kfree(compressor);
+ 		return -EINVAL;
++	}
+ 
+ 	down_write(&zram->init_lock);
+ 	if (init_done(zram)) {
+ 		up_write(&zram->init_lock);
+ 		pr_info("Can't change algorithm for initialized device\n");
++		kfree(compressor);
+ 		return -EBUSY;
+ 	}
+ 
+-	strcpy(zram->compressor, compressor);
++	ret = comp_algorithm_set(zram, prio, compressor);
+ 	up_write(&zram->init_lock);
+-	return len;
++	kfree(compressor);
++
++	return ret ? ret : len;
++}
++
++static ssize_t comp_algorithm_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t len)
++{
++	return __comp_algorithm_store(dev, buf, len, ZRAM_PRIMARY_COMP);
++}
++
++#ifdef CONFIG_ZRAM_MULTI_COMP
++static ssize_t recomp_algorithm_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct zram *zram = dev_to_zram(dev);
++	size_t sz = 0;
++	int prio;
++
++	down_read(&zram->init_lock);
++	for (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
++		if (!zram->comp_algs[prio])
++			continue;
++
++		sz += scnprintf(buf + sz, PAGE_SIZE - sz - 2, "#%d: ", prio);
++		sz += zcomp_available_show(zram->comp_algs[prio], buf + sz);
++	}
++	up_read(&zram->init_lock);
++
++	return sz;
++}
++
++static int zram_parse_arg(char **args, char **param, char **val)
++{
++	char *token, *eq;
++
++	do {
++		token = strsep(args, " \t\n");
++		if (!token)
++			return 0;
++	} while (!*token);
++
++	eq = strchr(token, '=');
++	if (!eq)
++		return -EINVAL;
++
++	*eq = '\0';
++	*param = token;
++	*val = eq + 1;
++
++	return 1;
++}
++
++static ssize_t recomp_algorithm_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t len)
++{
++	struct zram *zram = dev_to_zram(dev);
++	char *args, *param, *val, *algo = NULL, *prio_str = NULL;
++	u32 prio;
++	int ret;
++
++	args = skip_spaces(buf);
++	while ((ret = zram_parse_arg(&args, &param, &val)) > 0) {
++		if (!strcmp(param, "algo"))
++			algo = val;
++		else if (!strcmp(param, "priority"))
++			prio_str = val;
++		else
++			return -EINVAL;
++	}
++	if (ret < 0)
++		return ret;
++
++	if (!algo)
++		return -EINVAL;
++
++	if (!zcomp_available_algorithm(algo))
++		return -EINVAL;
++
++	if (prio_str) {
++		ret = kstrtouint(prio_str, 10, &prio);
++		if (ret)
++			return ret;
++	} else {
++		prio = ZRAM_SECONDARY_COMP;
++	}
++
++	if (!prio || prio >= ZRAM_MAX_COMPS)
++		return -EINVAL;
++
++	down_write(&zram->init_lock);
++	if (init_done(zram)) {
++		up_write(&zram->init_lock);
++		pr_info("Can't change algorithm for initialized device\n");
++		return -EBUSY;
++	}
++
++	ret = comp_algorithm_set(zram, prio, algo);
++	up_write(&zram->init_lock);
++
++	return ret ? ret : len;
+ }
++#endif
+ 
+ static ssize_t compact_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t len)
+@@ -2431,6 +2587,11 @@ static void zram_free_page(struct zram *zram, size_t index)
+ 		atomic64_dec(&zram->stats.huge_pages);
+ 	}
+ 
++	if (zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
++		zram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE);
++
++	zram_set_priority(zram, index, ZRAM_PRIMARY_COMP);
++
+ 	if (zram_test_flag(zram, index, ZRAM_WB)) {
+ #ifdef CONFIG_ZRAM_LRU_WRITEBACK
+ 		int size;
+@@ -2496,13 +2657,61 @@ out:
+ 		~(1UL << ZRAM_LOCK | 1UL << ZRAM_UNDER_WB));
+ }
+ 
+-static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
+-				struct bio *bio, bool partial_io)
++static int zram_read_from_zspool(struct zram *zram, struct page *page,
++				 u32 index)
+ {
+-	int ret;
++	struct zcomp_strm *zstrm;
+ 	unsigned long handle;
+ 	unsigned int size;
++	u32 prio;
++	int ret;
+ 	void *src, *dst;
++
++	handle = zram_get_handle(zram, index);
++	if (!handle || zram_test_flag(zram, index, ZRAM_SAME)) {
++		unsigned long value;
++
++		value = handle ? zram_get_element(zram, index) : 0;
++		dst = kmap_atomic(page);
++		zram_fill_page(dst, PAGE_SIZE, value);
++		kunmap_atomic(dst);
++		return 0;
++	}
++
++	size = zram_get_obj_size(zram, index);
++
++	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
++	if (size == PAGE_SIZE) {
++		dst = kmap_atomic(page);
++		memcpy(dst, src, PAGE_SIZE);
++		kunmap_atomic(dst);
++		ret = 0;
++	} else {
++		prio = zram_get_priority(zram, index);
++		zstrm = zcomp_stream_get(zram->comps[prio]);
++		dst = kmap_atomic(page);
++		ret = zcomp_decompress(zstrm, src, size, dst);
++		kunmap_atomic(dst);
++		zcomp_stream_put(zram->comps[prio]);
++	}
++	zs_unmap_object(zram->mem_pool, handle);
++
++	/* Should NEVER happen. BUG() if it does. */
++	if (unlikely(ret)) {
++		pr_err("Decompression failed! err=%d, page=%u, len=%u, addr=%p\n",
++		       ret, index, size, src);
++		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 16, 1,
++				src, size, 1);
++		BUG();
++	}
++
++	return ret;
++}
++
++static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
++				struct bio *bio, bool partial_io)
++{
++	int ret;
+ #ifdef CONFIG_ZRAM_LRU_WRITEBACK
+ 	unsigned long flags;
+ #endif
+@@ -2535,42 +2744,9 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
+ 				bio, partial_io);
+ 	}
+ 
+-	handle = zram_get_handle(zram, index);
+-	if (!handle || zram_test_flag(zram, index, ZRAM_SAME)) {
+-		unsigned long value;
+-		void *mem;
+-
+-		value = handle ? zram_get_element(zram, index) : 0;
+-		mem = kmap_atomic(page);
+-		zram_fill_page(mem, PAGE_SIZE, value);
+-		kunmap_atomic(mem);
+-		zram_slot_unlock(zram, index);
+-		return 0;
+-	}
+-
+-	size = zram_get_obj_size(zram, index);
+-
+-	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
+-	if (size == PAGE_SIZE) {
+-		dst = kmap_atomic(page);
+-		memcpy(dst, src, PAGE_SIZE);
+-		kunmap_atomic(dst);
+-		ret = 0;
+-	} else {
+-		struct zcomp_strm *zstrm = zcomp_stream_get(zram->comp);
+-
+-		dst = kmap_atomic(page);
+-		ret = zcomp_decompress(zstrm, src, size, dst);
+-		kunmap_atomic(dst);
+-		zcomp_stream_put(zram->comp);
+-	}
+-	/* Should NEVER happen. BUG() if it does. */
+-	if (unlikely(ret)) {
+-		pr_err("Decompression failed! err=%d, page=%u, len=%u, addr=%p\n", ret, index, size, src);
+-		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 16, 1, src, size, 1);
+-		BUG();
+-	}
+-	zs_unmap_object(zram->mem_pool, handle);
++	ret = zram_read_from_zspool(zram, page, index);
++	if (unlikely(ret))
++		goto out;
+ #ifdef CONFIG_ZRAM_LRU_WRITEBACK
+ 	if (zram_test_flag(zram, index, ZRAM_UNDER_PPR))
+ 		zram_clear_flag(zram, index, ZRAM_UNDER_PPR);
+@@ -2584,6 +2760,7 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
+ 	}
+ 	spin_unlock_irqrestore(&zram->list_lock, flags);
+ #endif
++out:
+ 	zram_slot_unlock(zram, index);
+ 
+ 	return ret;
+@@ -2649,13 +2826,13 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 	kunmap_atomic(mem);
+ 
+ compress_again:
+-	zstrm = zcomp_stream_get(zram->comp);
++	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
+ 	src = kmap_atomic(page);
+ 	ret = zcomp_compress(zstrm, src, &comp_len);
+ 	kunmap_atomic(src);
+ 
+ 	if (unlikely(ret)) {
+-		zcomp_stream_put(zram->comp);
++		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+ 		pr_err("Compression failed! err=%d\n", ret);
+ 		zs_free(zram->mem_pool, handle);
+ 		return ret;
+@@ -2683,7 +2860,7 @@ compress_again:
+ 				__GFP_HIGHMEM |
+ 				__GFP_MOVABLE);
+ 	if (!handle) {
+-		zcomp_stream_put(zram->comp);
++		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+ 		atomic64_inc(&zram->stats.writestall);
+ 		handle = zs_malloc(zram->mem_pool, comp_len,
+ 				GFP_NOIO | __GFP_HIGHMEM |
+@@ -2698,7 +2875,7 @@ compress_again:
+ 	update_used_max(zram, alloced_pages);
+ 
+ 	if (zram->limit_pages && alloced_pages > zram->limit_pages) {
+-		zcomp_stream_put(zram->comp);
++		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+ 		zs_free(zram->mem_pool, handle);
+ 		return -ENOMEM;
+ 	}
+@@ -2712,7 +2889,7 @@ compress_again:
+ 	if (comp_len == PAGE_SIZE)
+ 		kunmap_atomic(src);
+ 
+-	zcomp_stream_put(zram->comp);
++	zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+ 	zs_unmap_object(zram->mem_pool, handle);
+ 	atomic64_add(comp_len, &zram->stats.compr_data_size);
+ out:
+@@ -2796,6 +2973,279 @@ out:
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_ZRAM_MULTI_COMP
++static int zram_recompress(struct zram *zram, u32 index, struct page *page,
++			   u32 threshold, u32 prio, u32 prio_max)
++{
++	struct zcomp_strm *zstrm = NULL;
++	unsigned long handle_old;
++	unsigned long handle_new;
++	unsigned int comp_len_old;
++	unsigned int comp_len_new;
++	unsigned int class_index_old;
++	unsigned int class_index_new;
++	u32 num_recomps = 0;
++	void *src, *dst;
++	int ret;
++
++	handle_old = zram_get_handle(zram, index);
++	if (!handle_old)
++		return -EINVAL;
++
++	comp_len_old = zram_get_obj_size(zram, index);
++	/*
++	 * Do not recompress objects that are already "small enough".
++	 */
++	if (comp_len_old < threshold)
++		return 0;
++
++	ret = zram_read_from_zspool(zram, page, index);
++	if (ret)
++		return ret;
++
++	class_index_old = zs_lookup_class_index(zram->mem_pool, comp_len_old);
++	/*
++	 * Iterate the secondary comp algorithms list (in order of priority)
++	 * and try to recompress the page.
++	 */
++	for (; prio < prio_max; prio++) {
++		if (!zram->comps[prio])
++			continue;
++
++		/*
++		 * Skip if the object is already re-compressed with a higher
++		 * priority algorithm (or same algorithm).
++		 */
++		if (prio <= zram_get_priority(zram, index))
++			continue;
++
++		num_recomps++;
++		zstrm = zcomp_stream_get(zram->comps[prio]);
++		src = kmap_atomic(page);
++		ret = zcomp_compress(zstrm, src, &comp_len_new);
++		kunmap_atomic(src);
++
++		if (ret) {
++			zcomp_stream_put(zram->comps[prio]);
++			return ret;
++		}
++
++		class_index_new = zs_lookup_class_index(zram->mem_pool,
++							comp_len_new);
++
++		/* Continue until we make progress */
++		if (class_index_new >= class_index_old ||
++		    (threshold && comp_len_new >= threshold)) {
++			zcomp_stream_put(zram->comps[prio]);
++			continue;
++		}
++
++		/* Recompression was successful so break out */
++		break;
++	}
++
++	/*
++	 * We did not try to recompress, e.g. when we have only one
++	 * secondary algorithm and the page is already recompressed
++	 * using that algorithm.
++	 */
++	if (!zstrm)
++		return 0;
++
++	if (class_index_new >= class_index_old) {
++		/*
++		 * Secondary algorithms failed to re-compress the page
++		 * in a way that would save memory, mark the object as
++		 * incompressible so that we will not try to compress
++		 * it again.
++		 *
++		 * We need to make sure that all secondary algorithms have
++		 * failed, so we test if the number of recompressions matches
++		 * the number of active secondary algorithms.
++		 */
++		if (num_recomps == zram->num_active_comps - 1)
++			zram_set_flag(zram, index, ZRAM_INCOMPRESSIBLE);
++		return 0;
++	}
++
++	/* Successful recompression but above threshold */
++	if (threshold && comp_len_new >= threshold)
++		return 0;
++
++	/*
++	 * No direct reclaim (slow path) for handle allocation and no
++	 * re-compression attempt (unlike in __zram_bvec_write()) since
++	 * we already have stored that object in zsmalloc. If we cannot
++	 * alloc memory for recompressed object then we bail out and
++	 * simply keep the old (existing) object in zsmalloc.
++	 */
++	handle_new = zs_malloc(zram->mem_pool, comp_len_new,
++			       __GFP_KSWAPD_RECLAIM |
++			       __GFP_NOWARN |
++			       __GFP_HIGHMEM |
++			       __GFP_MOVABLE);
++	if (!handle_new) {
++		zcomp_stream_put(zram->comps[prio]);
++		return -ENOMEM;
++	}
++
++	dst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);
++	memcpy(dst, zstrm->buffer, comp_len_new);
++	zcomp_stream_put(zram->comps[prio]);
++
++	zs_unmap_object(zram->mem_pool, handle_new);
++
++	/*
++	 * Unlike the upstream implementation, do not use zram_free_page()
++	 * here: the Samsung tree keeps LRU and idle state in this entry and
++	 * freeing the page would drop that state. Free the old object and
++	 * update the entry in place instead.
++	 */
++	if (zram_test_flag(zram, index, ZRAM_HUGE)) {
++		zram_clear_flag(zram, index, ZRAM_HUGE);
++		atomic64_dec(&zram->stats.huge_pages);
++	}
++	zs_free(zram->mem_pool, handle_old);
++	atomic64_sub(comp_len_old, &zram->stats.compr_data_size);
++	zram_set_handle(zram, index, handle_new);
++	zram_set_obj_size(zram, index, comp_len_new);
++	zram_set_priority(zram, index, prio);
++	zram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE);
++
++	atomic64_add(comp_len_new, &zram->stats.compr_data_size);
++
++	return 0;
++}
++
++#define RECOMPRESS_IDLE		(1 << 0)
++#define RECOMPRESS_HUGE		(1 << 1)
++
++static ssize_t recompress_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t len)
++{
++	u32 prio = ZRAM_SECONDARY_COMP, prio_max = ZRAM_MAX_COMPS;
++	struct zram *zram = dev_to_zram(dev);
++	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
++	char *args, *param, *val, *algo = NULL;
++	u32 mode = 0, threshold = 0;
++	unsigned long index;
++	struct page *page;
++	ssize_t ret;
++
++	args = skip_spaces(buf);
++	while ((ret = zram_parse_arg(&args, &param, &val)) > 0) {
++		if (!*val)
++			return -EINVAL;
++
++		if (!strcmp(param, "type")) {
++			if (!strcmp(val, "idle"))
++				mode = RECOMPRESS_IDLE;
++			if (!strcmp(val, "huge"))
++				mode = RECOMPRESS_HUGE;
++			if (!strcmp(val, "huge_idle"))
++				mode = RECOMPRESS_IDLE | RECOMPRESS_HUGE;
++			continue;
++		}
++
++		if (!strcmp(param, "threshold")) {
++			/*
++			 * We will re-compress only idle objects equal or
++			 * greater in size than watermark.
++			 */
++			ret = kstrtouint(val, 10, &threshold);
++			if (ret)
++				return ret;
++			continue;
++		}
++
++		if (!strcmp(param, "algo")) {
++			algo = val;
++			continue;
++		}
++	}
++	if (ret < 0)
++		return ret;
++
++	if (threshold >= PAGE_SIZE)
++		return -EINVAL;
++
++	down_read(&zram->init_lock);
++	if (!init_done(zram)) {
++		ret = -EINVAL;
++		goto release_init_lock;
++	}
++
++	if (algo) {
++		bool found = false;
++
++		for (; prio < ZRAM_MAX_COMPS; prio++) {
++			if (!zram->comp_algs[prio])
++				continue;
++
++			if (!strcmp(zram->comp_algs[prio], algo)) {
++				prio_max = min(prio + 1, ZRAM_MAX_COMPS);
++				found = true;
++				break;
++			}
++		}
++
++		if (!found) {
++			ret = -EINVAL;
++			goto release_init_lock;
++		}
++	}
++
++	page = alloc_page(GFP_KERNEL);
++	if (!page) {
++		ret = -ENOMEM;
++		goto release_init_lock;
++	}
++
++	ret = len;
++	for (index = 0; index < nr_pages; index++) {
++		int err = 0;
++
++		zram_slot_lock(zram, index);
++
++		if (!zram_allocated(zram, index))
++			goto next;
++
++		if (mode & RECOMPRESS_IDLE &&
++		    !zram_test_flag(zram, index, ZRAM_IDLE))
++			goto next;
++
++		if (mode & RECOMPRESS_HUGE &&
++		    !zram_test_flag(zram, index, ZRAM_HUGE))
++			goto next;
++
++		if (zram_test_flag(zram, index, ZRAM_WB) ||
++		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
++		    zram_test_flag(zram, index, ZRAM_UNDER_PPR) ||
++		    zram_test_flag(zram, index, ZRAM_SAME) ||
++		    zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
++			goto next;
++
++		err = zram_recompress(zram, index, page, threshold,
++				      prio, prio_max);
++next:
++		zram_slot_unlock(zram, index);
++		if (err) {
++			ret = err;
++			break;
++		}
++
++		cond_resched();
++	}
++
++	__free_page(page);
++
++release_init_lock:
++	up_read(&zram->init_lock);
++	return ret;
++}
++#endif
++
+ /*
+  * zram_bio_discard - handler on discard request
+  * @index: physical block index in PAGE_SIZE units
+@@ -3010,9 +3460,22 @@ out:
+ 	return ret;
+ }
+ 
++static void zram_destroy_comps(struct zram *zram)
++{
++	u32 prio;
++
++	for (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
++		if (!zram->comps[prio])
++			continue;
++
++		zcomp_destroy(zram->comps[prio]);
++		zram->comps[prio] = NULL;
++	}
++	zram->num_active_comps = 0;
++}
++
+ static void zram_reset_device(struct zram *zram)
+ {
+-	struct zcomp *comp;
+ 	u64 disksize;
+ 
+ 	down_write(&zram->init_lock);
+@@ -3024,19 +3487,20 @@ static void zram_reset_device(struct zram *zram)
+ 		return;
+ 	}
+ 
+-	comp = zram->comp;
+ 	disksize = zram->disksize;
+ 	zram->disksize = 0;
+ 
+ 	set_capacity(zram->disk, 0);
+ 	part_stat_set_all(&zram->disk->part0, 0);
+ 
+-	up_write(&zram->init_lock);
+ 	/* I/O operation under all of CPU are done so let's free */
+ 	zram_meta_free(zram, disksize);
++	zram_destroy_comps(zram);
+ 	memset(&zram->stats, 0, sizeof(zram->stats));
+-	zcomp_destroy(comp);
+ 	reset_bdev(zram);
++
++	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
++	up_write(&zram->init_lock);
+ }
+ 
+ static ssize_t disksize_store(struct device *dev,
+@@ -3046,6 +3510,7 @@ static ssize_t disksize_store(struct device *dev,
+ 	struct zcomp *comp;
+ 	struct zram *zram = dev_to_zram(dev);
+ 	int err;
++	u32 prio;
+ 
+ 	disksize = memparse(buf, NULL);
+ 	if (!disksize)
+@@ -3064,15 +3529,23 @@ static ssize_t disksize_store(struct device *dev,
+ 		goto out_unlock;
+ 	}
+ 
+-	comp = zcomp_create(zram->compressor);
+-	if (IS_ERR(comp)) {
+-		pr_err("Cannot initialise %s compressing backend\n",
+-				zram->compressor);
+-		err = PTR_ERR(comp);
+-		goto out_free_meta;
++	zram->num_active_comps = 0;
++	for (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
++		if (!zram->comp_algs[prio])
++			continue;
++
++		comp = zcomp_create(zram->comp_algs[prio]);
++		if (IS_ERR(comp)) {
++			pr_err("Cannot initialise %s compressing backend\n",
++			       zram->comp_algs[prio]);
++			err = PTR_ERR(comp);
++			goto out_free_comps;
++		}
++
++		zram->comps[prio] = comp;
++		zram->num_active_comps++;
+ 	}
+ 
+-	zram->comp = comp;
+ 	zram->disksize = disksize;
+ 	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
+ 
+@@ -3081,6 +3554,8 @@ static ssize_t disksize_store(struct device *dev,
+ 
+ 	return len;
+ 
++out_free_comps:
++	zram_destroy_comps(zram);
+ out_free_meta:
+ 	zram_meta_free(zram, disksize);
+ out_unlock:
+@@ -3166,6 +3641,10 @@ static DEVICE_ATTR_WO(mem_used_max);
+ static DEVICE_ATTR_WO(idle);
+ static DEVICE_ATTR_RW(max_comp_streams);
+ static DEVICE_ATTR_RW(comp_algorithm);
++#ifdef CONFIG_ZRAM_MULTI_COMP
++static DEVICE_ATTR_RW(recomp_algorithm);
++static DEVICE_ATTR_WO(recompress);
++#endif
+ #ifdef CONFIG_ZRAM_WRITEBACK
+ static DEVICE_ATTR_RW(backing_dev);
+ static DEVICE_ATTR_WO(writeback);
+@@ -3183,6 +3662,10 @@ static struct attribute *zram_disk_attrs[] = {
+ 	&dev_attr_idle.attr,
+ 	&dev_attr_max_comp_streams.attr,
+ 	&dev_attr_comp_algorithm.attr,
++#ifdef CONFIG_ZRAM_MULTI_COMP
++	&dev_attr_recomp_algorithm.attr,
++	&dev_attr_recompress.attr,
++#endif
+ #ifdef CONFIG_ZRAM_WRITEBACK
+ 	&dev_attr_backing_dev.attr,
+ 	&dev_attr_writeback.attr,
+@@ -3300,7 +3783,8 @@ static int zram_add(void)
+ 	disk_to_dev(zram->disk)->groups = zram_disk_attr_groups;
+ 	add_disk(zram->disk);
+ 
+-	strlcpy(zram->compressor, default_compressor, sizeof(zram->compressor));
++	zram->comp_algs[ZRAM_PRIMARY_COMP] = default_compressor;
++	zram->num_active_comps = 0;
+ 
+ 	zram_debugfs_register(zram);
+ 	pr_info("Added device: %s\n", zram->disk->disk_name);
+@@ -3318,6 +3802,7 @@ out_free_dev:
+ static int zram_remove(struct zram *zram)
+ {
+ 	struct block_device *bdev;
++	u32 prio;
+ 
+ 	bdev = bdget_disk(zram->disk, 0);
+ 	if (!bdev)
+@@ -3348,6 +3833,13 @@ static int zram_remove(struct zram *zram)
+ 	del_gendisk(zram->disk);
+ 	blk_cleanup_queue(zram->disk->queue);
+ 	put_disk(zram->disk);
++
++	for (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
++		if (zram->comp_algs[prio] &&
++		    zram->comp_algs[prio] != default_compressor)
++			kfree(zram->comp_algs[prio]);
++	}
++
+ 	kfree(zram);
+ 	return 0;
+ }
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index 89c580d..784c2b6 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -41,6 +41,7 @@
+  * the higher bits is for zram_pageflags.
+  */
+ #define ZRAM_FLAG_SHIFT 24
++#define ZRAM_COMP_PRIORITY_MASK 0x3
+ 
+ /* Flags for zram pages (table[page_no].flags) */
+ enum zram_pageflags {
+@@ -56,6 +57,11 @@ enum zram_pageflags {
+ 	ZRAM_PPR,
+ 	ZRAM_UNDER_PPR,
+ 	ZRAM_LRU,
++	ZRAM_INCOMPRESSIBLE,
++
++	/* bits 36 and 37 are used to store compression priority */
++	ZRAM_COMP_PRIORITY_BIT1,
++	ZRAM_COMP_PRIORITY_BIT2,
+ 
+ 	__NR_ZRAM_PAGEFLAGS,
+ };
+@@ -155,10 +161,14 @@ void swap_add_to_list(struct list_head *, swp_entry_t);
+ void swap_writeback_list(struct zwbs **, struct list_head *);
+ #endif
+ 
++#define ZRAM_PRIMARY_COMP	0
++#define ZRAM_SECONDARY_COMP	1
++#define ZRAM_MAX_COMPS	4
++
+ struct zram {
+ 	struct zram_table_entry *table;
+ 	struct zs_pool *mem_pool;
+-	struct zcomp *comp;
++	struct zcomp *comps[ZRAM_MAX_COMPS];
+ 	struct gendisk *disk;
+ 	/* Prevent concurrent execution of device init */
+ 	struct rw_semaphore init_lock;
+@@ -173,7 +183,8 @@ struct zram {
+ 	 * we can store in a disk.
+ 	 */
+ 	u64 disksize;	/* bytes */
+-	char compressor[CRYPTO_MAX_ALG_NAME];
++	const char *comp_algs[ZRAM_MAX_COMPS];
++	s8 num_active_comps;
+ 	/*
+ 	 * zram is claimed so open request will be failed
+ 	 */
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 4638ddd..6830bf0 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -48,6 +48,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t flags);
+ void zs_free(struct zs_pool *pool, unsigned long obj);
+ 
+ size_t zs_huge_class_size(struct zs_pool *pool);
++int zs_lookup_class_index(struct zs_pool *pool, unsigned int size);
+ 
+ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
+ 			enum zs_mapmode mm);
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index c2adf34..55b10c6 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1347,6 +1347,16 @@ static bool zspage_full(struct size_class *class, struct zspage *zspage)
+ 	return get_zspage_inuse(zspage) == class->objs_per_zspage;
+ }
+ 
++int zs_lookup_class_index(struct zs_pool *pool, unsigned int size)
++{
++	struct size_class *class;
++
++	class = pool->size_class[get_size_class_index(size)];
++
++	return class->index;
++}
++EXPORT_SYMBOL_GPL(zs_lookup_class_index);
++
+ unsigned long zs_get_total_pages(struct zs_pool *pool)
+ {
+ 	return atomic_long_read(&pool->pages_allocated);
+-- 
+2.54.0
+
+
+From fb9c6c1c8ec305e09f26f43bee5e382fc52c77ad Mon Sep 17 00:00:00 2001
+From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:22:04 +0100
+Subject: [PATCH 3/3] BACKPORT: f2fs: support age threshold based garbage
+ collection
+
+Backport the ATGC (age-threshold GC) victim selection policy to the
+Exynos9820 4.14 F2FS driver.
+
+When the atgc mount option is set and the filesystem is older than
+7 days, background GC uses GC_AT: dirty sections are collected into an
+rbtree ordered by section mtime, and the victim is chosen by a cost
+derived from section age and valid-block count instead of the
+cost-benefit or greedy algorithms. The age threshold, candidate ratio,
+candidate count and age weight are tunable at runtime through
+/sys/fs/f2fs/<dev>/atgc_*.
+
+Backported from: Galaxy S24 6.1 (S921BXXSGDZG1), based on upstream
+v5.11 commit 093749e296e2 ("f2fs: support age threshold based garbage
+collection") and follow-up 89e53ff1651a ("f2fs: atgc: fix to set
+default age threshold").
+
+Adapted for the Samsung 4.14 tree:
+- port only the GC_AT victim-selection path; the AT_SSR (age-threshold
+  SSR and inmem curseg) machinery from the same series is omitted
+  because this tree has no curseg->seg_type, NR_CURSEG_INMEM_TYPE or
+  f2fs_save_inmem_curseg()/f2fs_load_inmem_curseg() infrastructure.
+  Without AT_SSR, GC'd data keeps using CURSEG_COLD_DATA and SSR keeps
+  its existing policy; GC_AT itself is unaffected.
+- use a local mtime-keyed rbtree lookup helper because the 4.14
+  rb_entry layout (extent_cache) differs from the upstream one.
+- set sbi->gc_mode to GC_IDLE_AT in the sysfs gc_idle handler; the
+  upstream v5.11 patch stored the GC_AT policy value there, which
+  aliases GC_IDLE_GREEDY in the sb gc_mode enum.
+- add 64-bit show/store handling for atgc_age_threshold.
+
+There is no gc_urgent_sleep_thread knob in upstream F2FS or in this
+tree; the existing gc_urgent_sleep_time control is left unchanged.
+
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Author: @Devandroid-bit.
+---
+ fs/f2fs/f2fs.h              |  17 +++
+ fs/f2fs/gc.c                | 267 +++++++++++++++++++++++++++++++++++-
+ fs/f2fs/gc.h                |  15 ++
+ fs/f2fs/segment.c           |   1 +
+ fs/f2fs/segment.h           |   6 +
+ fs/f2fs/super.c             |  24 +++-
+ fs/f2fs/sysfs.c             |  41 +++++-
+ include/trace/events/f2fs.h |   3 +-
+ 8 files changed, 368 insertions(+), 6 deletions(-)
+
+diff --git a/fs/f2fs/f2fs.h b/fs/f2fs/f2fs.h
+index cfb4fee..892040d 100644
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@ -123,6 +123,7 @@ extern const char *f2fs_fault_name[FAULT_MAX];
+ #define F2FS_MOUNT_RESERVE_ROOT		0x01000000
+ #define F2FS_MOUNT_DISABLE_CHECKPOINT	0x02000000
+ #define F2FS_MOUNT_NORECOVERY		0x04000000
++#define F2FS_MOUNT_ATGC			0x08000000
+ 
+ #define F2FS_OPTION(sbi)	((sbi)->mount_opt)
+ #define clear_opt(sbi, option)	(F2FS_OPTION(sbi).opt &= ~F2FS_MOUNT_##option)
+@@ -1380,6 +1381,18 @@ struct inode_management {
+ 	unsigned long ino_num;			/* number of entries */
+ };
+ 
++/* for GC_AT */
++struct atgc_management {
++	bool atgc_enabled;			/* ATGC is enabled or not */
++	struct rb_root_cached root;		/* root of victim rb-tree */
++	struct list_head victim_list;		/* linked with all victim entries */
++	unsigned int victim_count;		/* victim count in rb-tree */
++	unsigned int candidate_ratio;		/* candidate ratio */
++	unsigned int max_candidate_count;	/* max candidate count */
++	unsigned int age_weight;		/* age weight, vblock_weight = 100 - age_weight */
++	unsigned long long age_threshold;	/* age threshold */
++};
++
+ /* For s_flag in struct f2fs_sb_info */
+ enum {
+ 	SBI_IS_DIRTY,				/* dirty flag for checkpoint */
+@@ -1412,6 +1425,7 @@ enum {
+ 	GC_NORMAL,
+ 	GC_IDLE_CB,
+ 	GC_IDLE_GREEDY,
++	GC_IDLE_AT,
+ 	GC_URGENT,
+ };
+ 
+@@ -1763,6 +1777,7 @@ struct f2fs_sb_info {
+ 						 * race between GC and GC or CP
+ 						 */
+ 	struct f2fs_gc_kthread	*gc_thread;	/* GC thread */
++	struct atgc_management am;		/* atgc management */
+ 	unsigned int cur_victim_sec;		/* current victim section num */
+ 	unsigned int gc_mode;			/* current GC state */
+ 	unsigned int next_victim_seg[2];	/* next segment in victim section */
+@@ -3903,6 +3918,8 @@ int f2fs_gc(struct f2fs_sb_info *sbi, bool sync, bool background,
+ 			unsigned int segno);
+ void f2fs_build_gc_manager(struct f2fs_sb_info *sbi);
+ int f2fs_resize_fs(struct f2fs_sb_info *sbi, __u64 block_count);
++int __init f2fs_create_garbage_collection_cache(void);
++void f2fs_destroy_garbage_collection_cache(void);
+ 
+ /*
+  * recovery.c
+diff --git a/fs/f2fs/gc.c b/fs/f2fs/gc.c
+index fa1cc08..2cd9c19 100644
+--- a/fs/f2fs/gc.c
++++ b/fs/f2fs/gc.c
+@@ -21,6 +21,8 @@
+ #include "gc.h"
+ #include <trace/events/f2fs.h>
+ 
++static struct kmem_cache *victim_entry_slab;
++
+ static int gc_thread_func(void *data)
+ {
+ 	struct f2fs_sb_info *sbi = data;
+@@ -166,7 +168,16 @@ void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi)
+ 
+ static int select_gc_type(struct f2fs_sb_info *sbi, int gc_type)
+ {
+-	int gc_mode = (gc_type == BG_GC) ? GC_CB : GC_GREEDY;
++	int gc_mode;
++
++	if (gc_type == BG_GC) {
++		if (sbi->am.atgc_enabled)
++			gc_mode = GC_AT;
++		else
++			gc_mode = GC_CB;
++	} else {
++		gc_mode = GC_GREEDY;
++	}
+ 
+ 	switch (sbi->gc_mode) {
+ 	case GC_IDLE_CB:
+@@ -176,6 +187,9 @@ static int select_gc_type(struct f2fs_sb_info *sbi, int gc_type)
+ 	case GC_URGENT:
+ 		gc_mode = GC_GREEDY;
+ 		break;
++	case GC_IDLE_AT:
++		gc_mode = GC_AT;
++		break;
+ 	}
+ 	return gc_mode;
+ }
+@@ -203,6 +217,7 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
+ 	 */
+ 	if (gc_type != FG_GC &&
+ 			(sbi->gc_mode != GC_URGENT) &&
++			p->gc_mode != GC_AT &&
+ 			p->max_search > sbi->max_victim_search)
+ 		p->max_search = sbi->max_victim_search;
+ 
+@@ -224,6 +239,8 @@ static unsigned int get_max_cost(struct f2fs_sb_info *sbi,
+ 		return 2 * sbi->blocks_per_seg * p->ofs_unit;
+ 	else if (p->gc_mode == GC_CB)
+ 		return UINT_MAX;
++	else if (p->gc_mode == GC_AT)
++		return UINT_MAX;
+ 	else /* No other gc_mode */
+ 		return 0;
+ }
+@@ -288,8 +305,11 @@ static inline unsigned int get_gc_cost(struct f2fs_sb_info *sbi,
+ 	/* alloc_mode == LFS */
+ 	if (p->gc_mode == GC_GREEDY)
+ 		return get_valid_blocks(sbi, segno, true);
+-	else
++	else if (p->gc_mode == GC_CB)
+ 		return get_cb_cost(sbi, segno);
++
++	f2fs_bug_on(sbi, 1);
++	return 0;
+ }
+ 
+ static unsigned int count_bits(const unsigned long *addr,
+@@ -304,6 +324,183 @@ static unsigned int count_bits(const unsigned long *addr,
+ 	return sum;
+ }
+ 
++static struct rb_node **atgc_lookup_rb_tree(struct rb_root_cached *root,
++				struct rb_node **parent, unsigned long long key,
++				bool *leftmost)
++{
++	struct rb_node **p = &root->rb_root.rb_node;
++	struct victim_entry *ve;
++
++	while (*p) {
++		*parent = *p;
++		ve = rb_entry(*parent, struct victim_entry, rb_node);
++
++		if (key < ve->mtime) {
++			p = &(*p)->rb_left;
++		} else {
++			p = &(*p)->rb_right;
++			*leftmost = false;
++		}
++	}
++
++	return p;
++}
++
++static struct victim_entry *attach_victim_entry(struct f2fs_sb_info *sbi,
++				unsigned long long mtime, unsigned int segno,
++				struct rb_node *parent, struct rb_node **p,
++				bool left_most)
++{
++	struct atgc_management *am = &sbi->am;
++	struct victim_entry *ve;
++
++	ve = f2fs_kmem_cache_alloc(victim_entry_slab, GFP_NOFS);
++
++	ve->mtime = mtime;
++	ve->segno = segno;
++
++	rb_link_node(&ve->rb_node, parent, p);
++	rb_insert_color_cached(&ve->rb_node, &am->root, left_most);
++
++	list_add_tail(&ve->list, &am->victim_list);
++
++	am->victim_count++;
++
++	return ve;
++}
++
++static void insert_victim_entry(struct f2fs_sb_info *sbi,
++				unsigned long long mtime, unsigned int segno)
++{
++	struct atgc_management *am = &sbi->am;
++	struct rb_node **p;
++	struct rb_node *parent = NULL;
++	bool left_most = true;
++
++	p = atgc_lookup_rb_tree(&am->root, &parent, mtime, &left_most);
++	attach_victim_entry(sbi, mtime, segno, parent, p, left_most);
++}
++
++static void add_victim_entry(struct f2fs_sb_info *sbi,
++				struct victim_sel_policy *p, unsigned int segno)
++{
++	struct sit_info *sit_i = SIT_I(sbi);
++	unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
++	unsigned int start = GET_SEG_FROM_SEC(sbi, secno);
++	unsigned long long mtime = 0;
++	unsigned int i;
++
++	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED)) &&
++			get_valid_blocks(sbi, segno, true) == 0)
++		return;
++
++	for (i = 0; i < sbi->segs_per_sec; i++)
++		mtime += get_seg_entry(sbi, start + i)->mtime;
++	mtime = div_u64(mtime, sbi->segs_per_sec);
++
++	/* Handle if the system time has changed by the user */
++	if (mtime < sit_i->min_mtime)
++		sit_i->min_mtime = mtime;
++	if (mtime > sit_i->max_mtime)
++		sit_i->max_mtime = mtime;
++	if (mtime < sit_i->dirty_min_mtime)
++		sit_i->dirty_min_mtime = mtime;
++	if (mtime > sit_i->dirty_max_mtime)
++		sit_i->dirty_max_mtime = mtime;
++
++	/* don't choose young section as candidate */
++	if (sit_i->dirty_max_mtime - mtime < p->age_threshold)
++		return;
++
++	insert_victim_entry(sbi, mtime, segno);
++}
++
++static void atgc_lookup_victim(struct f2fs_sb_info *sbi,
++						struct victim_sel_policy *p)
++{
++	struct sit_info *sit_i = SIT_I(sbi);
++	struct atgc_management *am = &sbi->am;
++	struct rb_root_cached *root = &am->root;
++	struct rb_node *node;
++	struct victim_entry *ve;
++	unsigned long long total_time;
++	unsigned long long age, u, accu;
++	unsigned long long max_mtime = sit_i->dirty_max_mtime;
++	unsigned long long min_mtime = sit_i->dirty_min_mtime;
++	unsigned int sec_blocks = BLKS_PER_SEC(sbi);
++	unsigned int vblocks;
++	unsigned int dirty_threshold = max(am->max_candidate_count,
++					am->candidate_ratio *
++					am->victim_count / 100);
++	unsigned int age_weight = am->age_weight;
++	unsigned int cost;
++	unsigned int iter = 0;
++
++	if (max_mtime < min_mtime)
++		return;
++
++	max_mtime += 1;
++	total_time = max_mtime - min_mtime;
++
++	accu = div64_u64(ULLONG_MAX, total_time);
++	accu = min_t(unsigned long long, div_u64(accu, 100),
++					DEFAULT_ACCURACY_CLASS);
++
++	node = rb_first_cached(root);
++next:
++	ve = rb_entry_safe(node, struct victim_entry, rb_node);
++	if (!ve)
++		return;
++
++	if (ve->mtime >= max_mtime || ve->mtime < min_mtime)
++		goto skip;
++
++	/* age = 10000 * x% * 60 */
++	age = div64_u64(accu * (max_mtime - ve->mtime), total_time) *
++								age_weight;
++
++	vblocks = get_valid_blocks(sbi, ve->segno, true);
++	f2fs_bug_on(sbi, !vblocks || vblocks == sec_blocks);
++
++	/* u = 10000 * x% * 40 */
++	u = div64_u64(accu * (sec_blocks - vblocks), sec_blocks) *
++							(100 - age_weight);
++
++	f2fs_bug_on(sbi, age + u >= UINT_MAX);
++
++	cost = UINT_MAX - (age + u);
++	iter++;
++
++	if (cost < p->min_cost ||
++			(cost == p->min_cost && age > p->oldest_age)) {
++		p->min_cost = cost;
++		p->oldest_age = age;
++		p->min_segno = ve->segno;
++	}
++skip:
++	if (iter < dirty_threshold) {
++		node = rb_next(node);
++		goto next;
++	}
++}
++
++static void release_victim_entry(struct f2fs_sb_info *sbi)
++{
++	struct atgc_management *am = &sbi->am;
++	struct victim_entry *ve, *tmp;
++
++	list_for_each_entry_safe(ve, tmp, &am->victim_list, list) {
++		list_del(&ve->list);
++		kmem_cache_free(victim_entry_slab, ve);
++		am->victim_count--;
++	}
++
++	am->root = RB_ROOT_CACHED;
++
++	f2fs_bug_on(sbi, am->victim_count);
++	f2fs_bug_on(sbi, !list_empty(&am->victim_list));
++}
++
+ /*
+  * This function is called from two paths.
+  * One is garbage collection and the other is SSR segment selection.
+@@ -320,17 +517,28 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
+ 	struct victim_sel_policy p;
+ 	unsigned int secno, last_victim;
+ 	unsigned int last_segment;
+-	unsigned int nsearched = 0;
++	unsigned int nsearched;
++	bool is_atgc;
+ 
+ 	mutex_lock(&dirty_i->seglist_lock);
+ 	last_segment = MAIN_SECS(sbi) * sbi->segs_per_sec;
+ 
+ 	p.alloc_mode = alloc_mode;
++	p.age_threshold = sbi->am.age_threshold;
++
++retry:
+ 	select_policy(sbi, gc_type, type, &p);
+ 
+ 	p.min_segno = NULL_SEGNO;
++	p.oldest_age = 0;
+ 	p.min_cost = get_max_cost(sbi, &p);
+ 
++	is_atgc = (p.gc_mode == GC_AT);
++	nsearched = 0;
++
++	if (is_atgc)
++		SIT_I(sbi)->dirty_min_mtime = ULLONG_MAX;
++
+ 	if (*result != NULL_SEGNO) {
+ 		if (get_valid_blocks(sbi, *result, false) &&
+ 			!sec_usage_check(sbi, GET_SEC_FROM_SEG(sbi, *result)))
+@@ -414,6 +622,12 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
+ 		/* W/A for FG_GC failure due to Atomic Write File and Pinned File */
+ 		if (test_bit(secno, dirty_i->blacklist_victim_secmap))
+ 			goto next;
++
++		if (is_atgc) {
++			add_victim_entry(sbi, &p, segno);
++			goto next;
++		}
++
+ 		cost = get_gc_cost(sbi, segno, &p);
+ 
+ 		if (p.min_cost > cost) {
+@@ -431,6 +645,19 @@ next:
+ 			break;
+ 		}
+ 	}
++
++	/* get victim for GC_AT */
++	if (is_atgc) {
++		atgc_lookup_victim(sbi, &p);
++		release_victim_entry(sbi);
++	}
++
++	if (is_atgc && p.min_segno == NULL_SEGNO &&
++			sm->elapsed_time < p.age_threshold) {
++		p.age_threshold = 0;
++		goto retry;
++	}
++
+ 	if (p.min_segno != NULL_SEGNO) {
+ got_it:
+ 		*result = (p.min_segno / p.ofs_unit) * p.ofs_unit;
+@@ -1443,6 +1670,38 @@ stop:
+ 	return ret;
+ }
+ 
++int __init f2fs_create_garbage_collection_cache(void)
++{
++	victim_entry_slab = f2fs_kmem_cache_create("f2fs_victim_entry",
++					sizeof(struct victim_entry));
++	if (!victim_entry_slab)
++		return -ENOMEM;
++	return 0;
++}
++
++void f2fs_destroy_garbage_collection_cache(void)
++{
++	kmem_cache_destroy(victim_entry_slab);
++}
++
++static void init_atgc_management(struct f2fs_sb_info *sbi)
++{
++	struct atgc_management *am = &sbi->am;
++
++	if (test_opt(sbi, ATGC) &&
++		SIT_I(sbi)->elapsed_time >= DEF_GC_THREAD_AGE_THRESHOLD)
++		am->atgc_enabled = true;
++
++	am->root = RB_ROOT_CACHED;
++	INIT_LIST_HEAD(&am->victim_list);
++	am->victim_count = 0;
++
++	am->candidate_ratio = DEF_GC_THREAD_CANDIDATE_RATIO;
++	am->max_candidate_count = DEF_GC_THREAD_MAX_CANDIDATE_COUNT;
++	am->age_weight = DEF_GC_THREAD_AGE_WEIGHT;
++	am->age_threshold = DEF_GC_THREAD_AGE_THRESHOLD;
++}
++
+ void f2fs_build_gc_manager(struct f2fs_sb_info *sbi)
+ {
+ 	DIRTY_I(sbi)->v_ops = &default_v_ops;
+@@ -1453,6 +1712,8 @@ void f2fs_build_gc_manager(struct f2fs_sb_info *sbi)
+ 	if (f2fs_is_multi_device(sbi) && !__is_large_section(sbi))
+ 		SIT_I(sbi)->last_victim[ALLOC_NEXT] =
+ 				GET_SEGNO(sbi, FDEV(0).end_blk) + 1;
++
++	init_atgc_management(sbi);
+ }
+ 
+ static int free_segment_range(struct f2fs_sb_info *sbi,
+diff --git a/fs/f2fs/gc.h b/fs/f2fs/gc.h
+index d5aa984..dd9707b 100644
+--- a/fs/f2fs/gc.h
++++ b/fs/f2fs/gc.h
+@@ -14,6 +14,14 @@
+ #define DEF_GC_THREAD_MIN_SLEEP_TIME	30000	/* milliseconds */
+ #define DEF_GC_THREAD_MAX_SLEEP_TIME	60000
+ #define DEF_GC_THREAD_NOGC_SLEEP_TIME	300000	/* wait 5 min */
++
++/* choose candidates from sections which has age of more than 7 days */
++#define DEF_GC_THREAD_AGE_THRESHOLD		(60 * 60 * 24 * 7)
++#define DEF_GC_THREAD_CANDIDATE_RATIO		20	/* select 20% oldest sections as candidates */
++#define DEF_GC_THREAD_MAX_CANDIDATE_COUNT	10	/* select at most 10 sections as candidates */
++#define DEF_GC_THREAD_AGE_WEIGHT		60	/* age weight */
++#define DEFAULT_ACCURACY_CLASS			10000	/* accuracy class */
++
+ #define LIMIT_INVALID_BLOCK	40 /* percentage over total user space */
+ #define LIMIT_FREE_BLOCK	40 /* percentage over invalid + free space */
+ 
+@@ -41,6 +49,13 @@ struct gc_inode_list {
+ 	struct radix_tree_root iroot;
+ };
+ 
++struct victim_entry {
++	struct rb_node rb_node;		/* rb node located in rb-tree */
++	unsigned long long mtime;	/* mtime of section */
++	unsigned int segno;		/* segment No. */
++	struct list_head list;
++};
++
+ /*
+  * inline functions
+  */
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+index fa2bd4c..e97fddc 100644
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -4519,6 +4519,7 @@ static void init_min_max_mtime(struct f2fs_sb_info *sbi)
+ 			sit_i->min_mtime = mtime;
+ 	}
+ 	sit_i->max_mtime = get_mtime(sbi, false);
++	sit_i->dirty_max_mtime = 0;
+ 	up_write(&sit_i->sentry_lock);
+ }
+ 
+diff --git a/fs/f2fs/segment.h b/fs/f2fs/segment.h
+index 8095eb0..e319690 100644
+--- a/fs/f2fs/segment.h
++++ b/fs/f2fs/segment.h
+@@ -142,10 +142,12 @@ enum {
+  * In the victim_sel_policy->gc_mode, there are two gc, aka cleaning, modes.
+  * GC_CB is based on cost-benefit algorithm.
+  * GC_GREEDY is based on greedy algorithm.
++ * GC_AT is based on age-threshold algorithm.
+  */
+ enum {
+ 	GC_CB = 0,
+ 	GC_GREEDY,
++	GC_AT,
+ 	ALLOC_NEXT,
+ 	FLUSH_DEVICE,
+ 	MAX_GC_POLICY,
+@@ -171,7 +173,9 @@ struct victim_sel_policy {
+ 	unsigned int offset;		/* last scanned bitmap offset */
+ 	unsigned int ofs_unit;		/* bitmap search unit */
+ 	unsigned int min_cost;		/* minimum cost */
++	unsigned long long oldest_age;	/* oldest age of segments having the same min cost */
+ 	unsigned int min_segno;		/* segment # having min. cost */
++	unsigned long long age_threshold;/* age threshold */
+ };
+ 
+ struct seg_entry {
+@@ -237,6 +241,8 @@ struct sit_info {
+ 	unsigned long long mounted_time;	/* mount time */
+ 	unsigned long long min_mtime;		/* min. modification time */
+ 	unsigned long long max_mtime;		/* max. modification time */
++	unsigned long long dirty_min_mtime;	/* rerange candidates in GC_AT */
++	unsigned long long dirty_max_mtime;	/* rerange candidates in GC_AT */
+ 
+ 	unsigned int last_victim[MAX_GC_POLICY]; /* last victim segment # */
+ };
+diff --git a/fs/f2fs/super.c b/fs/f2fs/super.c
+index 202c767..624a14e 100644
+--- a/fs/f2fs/super.c
++++ b/fs/f2fs/super.c
+@@ -156,6 +156,7 @@ enum {
+ 	Opt_compress_algorithm,
+ 	Opt_compress_log_size,
+ 	Opt_compress_extension,
++	Opt_atgc,
+ 	Opt_err,
+ };
+ 
+@@ -225,6 +226,7 @@ static match_table_t f2fs_tokens = {
+ 	{Opt_compress_algorithm, "compress_algorithm=%s"},
+ 	{Opt_compress_log_size, "compress_log_size=%u"},
+ 	{Opt_compress_extension, "compress_extension=%s"},
++	{Opt_atgc, "atgc"},
+ 	{Opt_err, NULL},
+ };
+ 
+@@ -1047,6 +1049,9 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
+ 			}
+ 			F2FS_OPTION(sbi).ckpt_ioprio = (unsigned int)arg;
+ 			break;
++		case Opt_atgc:
++			set_opt(sbi, ATGC);
++			break;
+ 		default:
+ 			f2fs_err(sbi, "Unrecognized mount option \"%s\" or missing value",
+ 				 p);
+@@ -1771,6 +1776,9 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
+ 					F2FS_OPTION(sbi).flush_group));
+ 
+ 	f2fs_show_compress_options(seq, sbi->sb);
++
++	if (test_opt(sbi, ATGC))
++		seq_puts(seq, ",atgc");
+ 	return 0;
+ }
+ 
+@@ -1955,6 +1963,7 @@ static int f2fs_remount(struct vfsmount *mnt, struct super_block *sb,
+ 	bool need_restart_gc = false;
+ 	bool need_stop_gc = false;
+ 	bool no_extent_cache = !test_opt(sbi, EXTENT_CACHE);
++	bool no_atgc = !test_opt(sbi, ATGC);
+ 	bool disable_checkpoint = test_opt(sbi, DISABLE_CHECKPOINT);
+ 	bool no_io_align = !F2FS_IO_ALIGNED(sbi);
+ 	bool checkpoint_changed;
+@@ -2039,6 +2048,13 @@ static int f2fs_remount(struct vfsmount *mnt, struct super_block *sb,
+ 		goto restore_opts;
+ 	}
+ 
++	/* disallow enable atgc dynamically */
++	if (no_atgc == !!test_opt(sbi, ATGC)) {
++		err = -EINVAL;
++		f2fs_warn(sbi, "switch atgc option is not allowed");
++		goto restore_opts;
++	}
++
+ 	if (no_io_align == !!F2FS_IO_ALIGNED(sbi)) {
+ 		err = -EINVAL;
+ 		f2fs_warn(sbi, "switch io_bits option is not allowed");
+@@ -4217,9 +4233,12 @@ static int __init init_f2fs_fs(void)
+ 	err = f2fs_create_extent_cache();
+ 	if (err)
+ 		goto free_checkpoint_caches;
+-	err = f2fs_init_sysfs();
++	err = f2fs_create_garbage_collection_cache();
+ 	if (err)
+ 		goto free_extent_cache;
++	err = f2fs_init_sysfs();
++	if (err)
++		goto free_garbage_collection_cache;
+ 	err = register_shrinker(&f2fs_shrinker_info);
+ 	if (err)
+ 		goto free_sysfs;
+@@ -4253,6 +4272,8 @@ free_shrinker:
+ 	unregister_shrinker(&f2fs_shrinker_info);
+ free_sysfs:
+ 	f2fs_exit_sysfs();
++free_garbage_collection_cache:
++	f2fs_destroy_garbage_collection_cache();
+ free_extent_cache:
+ 	f2fs_destroy_extent_cache();
+ free_checkpoint_caches:
+@@ -4277,6 +4298,7 @@ static void __exit exit_f2fs_fs(void)
+ 	unregister_filesystem(&f2fs_fs_type);
+ 	unregister_shrinker(&f2fs_shrinker_info);
+ 	f2fs_exit_sysfs();
++	f2fs_destroy_garbage_collection_cache();
+ 	f2fs_destroy_extent_cache();
+ 	f2fs_destroy_checkpoint_caches();
+ 	f2fs_destroy_segment_manager_caches();
+diff --git a/fs/f2fs/sysfs.c b/fs/f2fs/sysfs.c
+index 3336d97..ae97620 100644
+--- a/fs/f2fs/sysfs.c
++++ b/fs/f2fs/sysfs.c
+@@ -38,6 +38,7 @@ enum {
+ 	FAULT_INFO_TYPE,	/* struct f2fs_fault_info */
+ #endif
+ 	RESERVED_BLOCKS,	/* struct f2fs_sb_info */
++	ATGC_INFO,		/* struct atgc_management */
+ };
+ 
+ #ifdef CONFIG_F2FS_SEC_BLOCK_OPERATIONS_DEBUG
+@@ -79,6 +80,8 @@ static unsigned char *__struct_ptr(struct f2fs_sb_info *sbi, int struct_type)
+ 		return (unsigned char *)NM_I(sbi);
+ 	else if (struct_type == F2FS_SBI || struct_type == RESERVED_BLOCKS)
+ 		return (unsigned char *)sbi;
++	else if (struct_type == ATGC_INFO)
++		return (unsigned char *)&sbi->am;
+ #ifdef CONFIG_F2FS_FAULT_INJECTION
+ 	else if (struct_type == FAULT_INFO_RATE ||
+ 					struct_type == FAULT_INFO_TYPE)
+@@ -728,6 +731,13 @@ static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
+ 
+ 	ui = (unsigned int *)(ptr + a->offset);
+ 
++	if (!strcmp(a->attr.name, "atgc_age_threshold")) {
++		unsigned long long *ull =
++				(unsigned long long *)(ptr + a->offset);
++
++		return sprintf(buf, "%llu\n", *ull);
++	}
++
+ 	return sprintf(buf, "%u\n", *ui);
+ }
+ 
+@@ -825,6 +835,21 @@ out:
+ 		return count;
+ 	}
+ 
++	if (!strcmp(a->attr.name, "atgc_candidate_ratio") ||
++			!strcmp(a->attr.name, "atgc_age_weight")) {
++		if (t > 100)
++			return -EINVAL;
++		*ui = (unsigned int)t;
++		return count;
++	}
++
++	if (!strcmp(a->attr.name, "atgc_age_threshold")) {
++		unsigned long long *ull = (unsigned long long *)ui;
++
++		*ull = t;
++		return count;
++	}
++
+ 	if (!strcmp(a->attr.name, "discard_granularity")) {
+ 		if (t == 0 || t > MAX_PLIST_NUM)
+ 			return -EINVAL;
+@@ -861,7 +886,11 @@ out:
+ 			sbi->gc_mode = GC_IDLE_CB;
+ 		else if (t == GC_IDLE_GREEDY)
+ 			sbi->gc_mode = GC_IDLE_GREEDY;
+-		else
++		else if (t == GC_IDLE_AT) {
++			if (!sbi->am.atgc_enabled)
++				return -EINVAL;
++			sbi->gc_mode = GC_IDLE_AT;
++		} else
+ 			sbi->gc_mode = GC_NORMAL;
+ 		return count;
+ 	}
+@@ -1071,6 +1100,12 @@ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, sec_fua_mode, s_sec_cond_fua_mode);
+ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, sec_hqm_preserve, sec_hqm_preserve);
+ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, data_io_flag, data_io_flag);
+ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, node_io_flag, node_io_flag);
++
++/* For ATGC */
++F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_candidate_ratio, candidate_ratio);
++F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_candidate_count, max_candidate_count);
++F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_age_weight, age_weight);
++F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_age_threshold, age_threshold);
+ F2FS_GENERAL_RO_ATTR(dirty_segments);
+ F2FS_GENERAL_RO_ATTR(free_segments);
+ F2FS_GENERAL_RO_ATTR(lifetime_write_kbytes);
+@@ -1171,6 +1206,10 @@ static struct attribute *f2fs_attrs[] = {
+ #endif
+ 	ATTR_LIST(data_io_flag),
+ 	ATTR_LIST(node_io_flag),
++	ATTR_LIST(atgc_candidate_ratio),
++	ATTR_LIST(atgc_candidate_count),
++	ATTR_LIST(atgc_age_weight),
++	ATTR_LIST(atgc_age_threshold),
+ 	ATTR_LIST(dirty_segments),
+ 	ATTR_LIST(free_segments),
+ 	ATTR_LIST(unusable),
+diff --git a/include/trace/events/f2fs.h b/include/trace/events/f2fs.h
+index d326095..6d03d41 100644
+--- a/include/trace/events/f2fs.h
++++ b/include/trace/events/f2fs.h
+@@ -127,7 +127,8 @@ TRACE_DEFINE_ENUM(CP_RESIZE);
+ #define show_victim_policy(type)					\
+ 	__print_symbolic(type,						\
+ 		{ GC_GREEDY,	"Greedy" },				\
+-		{ GC_CB,	"Cost-Benefit" })
++		{ GC_CB,	"Cost-Benefit" },			\
++		{ GC_AT,	"Age-threshold" })
+ 
+ #define show_cpreason(type)						\
+ 	__print_flags(type, "|",					\
+-- 
+2.54.0
+
