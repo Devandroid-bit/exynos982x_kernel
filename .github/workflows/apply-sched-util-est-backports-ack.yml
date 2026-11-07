@@ -80,7 +80,12 @@ jobs:
             VERIFY_BASE=$START_SHA
           else
             diff -u "$FINAL_FILES" "$ACTUAL_BASE_FILES"
-            git diff --quiet "$SOURCE_TREE" "$START_SHA" -- . ':(exclude).github/workflows'
+            SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-detect"
+            rm -f "$SOURCE_INDEX"
+            GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree "$START_SHA"
+            GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q "$WORKFLOW_PATH" "$PATCH_PATH"
+            test "$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree)" = "$SOURCE_TREE"
+            rm -f "$SOURCE_INDEX"
             VERIFY_BASE=$(git rev-parse "${START_SHA}~4")
             test "$(git rev-list --count "$VERIFY_BASE..$START_SHA")" -eq 4
             STATE=already-applied
@@ -125,7 +130,12 @@ jobs:
             "kernel/sched/fair.c" | LC_ALL=C sort > "$SOURCE_FILES"
           git diff --name-only "$VERIFY_BASE" HEAD | LC_ALL=C sort > "$ACTUAL_SOURCE_FILES"
           diff -u "$SOURCE_FILES" "$ACTUAL_SOURCE_FILES"
-          git diff --quiet "$SOURCE_TREE" HEAD -- . ':(exclude).github/workflows'
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-verify"
+          rm -f "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree HEAD
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q "$WORKFLOW_PATH" "$PATCH_PATH"
+          test "$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree)" = "$SOURCE_TREE"
+          rm -f "$SOURCE_INDEX"
 
           FINAL_FILES="$RUNNER_TEMP/expected-final-files"
           ACTUAL_FINAL_FILES="$RUNNER_TEMP/actual-final-files"
@@ -186,6 +196,12 @@ jobs:
           git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
           REMOTE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
           HEAD_SHA=$(git rev-parse HEAD)
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-remote"
+          rm -f "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree "$REMOTE_SHA"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q --ignore-unmatch "$WORKFLOW_PATH" "$PATCH_PATH"
+          REMOTE_SOURCE_TREE=$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree)
+          rm -f "$SOURCE_INDEX"
 
           if [ "$REMOTE_SHA" = "$HEAD_SHA" ]; then
             RESULT_SHA=$REMOTE_SHA
@@ -198,7 +214,7 @@ jobs:
             RESULT_SHA=$HEAD_SHA
           elif git merge-base --is-ancestor "$START_SHA" "$REMOTE_SHA" &&
                test "$(git rev-list --count "$START_SHA..$REMOTE_SHA")" -eq 4 &&
-               git diff --quiet "$SOURCE_TREE" "$REMOTE_SHA" -- . ':(exclude).github/workflows' &&
+               test "$REMOTE_SOURCE_TREE" = "$SOURCE_TREE" &&
                git diff --quiet "$START_SHA" "$REMOTE_SHA" -- .github/workflows; then
             RESULT_SHA=$REMOTE_SHA
             echo "Target branch already has the expected backports; nothing to push."
