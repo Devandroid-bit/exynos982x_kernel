@@ -1,0 +1,546 @@
+From 295c9819eaa904a5a29eb5cb298bc52e1d1351d7 Mon Sep 17 00:00:00 2001
+From: Patrick Bellasi <patrick.bellasi@arm.com>
+Date: Mon, 5 Nov 2018 14:53:59 +0000
+Subject: [PATCH 1/4] BACKPORT: sched/fair: Mask UTIL_AVG_UNCHANGED usages
+
+_task_util_est() is mainly used to add/remove the task contribution
+to/from the rq's estimated utilization at task enqueue/dequeue time.
+In both cases the UTIL_AVG_UNCHANGED flag is set to keep consistency
+between enqueue and dequeue time while still being transparent to
+update_load_avg() calls, which eventually reset the flag.
+
+Move the flag forcing inside _task_util_est() itself so the estimated
+utilization implementation detail is hidden from the callers. This also
+simplifies the enqueue, dequeue and cpu_util_without() sites.
+
+Backported from: 92a801e5d5b7a893881c1676b15dd246727ccd16
+("sched/fair: Mask UTIL_AVG_UNCHANGED usages") by Patrick Bellasi.
+Source: upstream Linux (torvalds/linux), v4.20 scheduler series.
+
+The target has the same pre-fix util_est layout as the upstream parent;
+only context line numbers differ.
+
+This is patch 1/4 of the util_est correctness backport.
+
+Signed-off-by: Patrick Bellasi <patrick.bellasi@arm.com>
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+---
+ kernel/sched/fair.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index cbb451c13fd72b274152d2770711e254e08b0255..3aa273f02da15db1f3ad910d8ce3c499efaa5099 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3728,7 +3728,7 @@ static inline unsigned long _task_util_est(struct task_struct *p)
+ {
+ 	struct util_est ue = READ_ONCE(p->se.avg.util_est);
+ 
+-	return max(ue.ewma, ue.enqueued);
++	return (max(ue.ewma, ue.enqueued) | UTIL_AVG_UNCHANGED);
+ }
+ 
+ static inline unsigned long task_util_est(struct task_struct *p)
+@@ -3751,7 +3751,7 @@ static inline void util_est_enqueue(struct cfs_rq *cfs_rq,
+ 
+ 	/* Update root cfs_rq's estimated utilization */
+ 	enqueued  = cfs_rq->avg.util_est.enqueued;
+-	enqueued += (_task_util_est(p) | UTIL_AVG_UNCHANGED);
++	enqueued += _task_util_est(p);
+ 	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, enqueued);
+ 
+ 	trace_sched_util_est_task(p, &p->se.avg);
+@@ -3782,8 +3782,7 @@ util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p, bool task_sleep)
+ 
+ 	/* Update root cfs_rq's estimated utilization */
+ 	ue.enqueued  = cfs_rq->avg.util_est.enqueued;
+-	ue.enqueued -= min_t(unsigned int, ue.enqueued,
+-			     (_task_util_est(p) | UTIL_AVG_UNCHANGED));
++	ue.enqueued -= min_t(unsigned int, ue.enqueued, _task_util_est(p));
+ 	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, ue.enqueued);
+ 
+ 	trace_sched_util_est_cpu(cpu_of(rq_of(cfs_rq)), cfs_rq);
+@@ -6092,7 +6091,7 @@ static unsigned long cpu_util_without(int cpu, struct task_struct *p)
+ 		 */
+ 		if (unlikely(task_on_rq_queued(p) || current == p)) {
+ 			estimated -= min_t(unsigned int, estimated,
+-					   (_task_util_est(p) | UTIL_AVG_UNCHANGED));
++					   _task_util_est(p));
+ 		}
+ 		util = max(util, estimated);
+ 	}
+-- 
+2.54.0
+
+
+From b9f61481dc7b61676eea9d0943e7a00a3cae9910 Mon Sep 17 00:00:00 2001
+From: Xuewen Yan <xuewen.yan@unisoc.com>
+Date: Fri, 18 Dec 2020 17:27:52 +0800
+Subject: [PATCH 2/4] BACKPORT: sched/fair: Avoid stale CPU util_est value for
+ schedutil in task dequeue
+
+CPU (root cfs_rq) estimated utilization is currently updated after
+dequeue_task_fair() has already notified schedutil. schedutil can
+therefore observe a stale CPU_utilization during task ramp-up or
+ramp-down.
+
+Split the combined util_est dequeue update into:
+
+ (A) CPU_util_est subtraction in util_est_dequeue()
+ (B) task_util_est EWMA update in util_est_update()
+
+Place (A) before the dequeue loops and before schedtune_dequeue_task(),
+and keep (B) at the end where the task PELT value has been updated.
+
+Backported from: 8c1f560c1ea3f19e22ba356f62680d9d449c9ec2
+("sched/fair: Avoid stale CPU util_est value for schedutil in task
+dequeue") by Xuewen Yan.
+Source: upstream Linux (torvalds/linux); this commit is an ancestor of the
+b89997aa88f0 task util_est filtering fix.
+
+Adapted for the Exynos9820 4.14 tree:
+- the target still has a combined util_est_dequeue(cfs_rq, p, task_sleep);
+  split it in place into util_est_dequeue() and util_est_update();
+- keep the target trace_sched_util_est_cpu() event and the Samsung
+  dequeue_multi_load() hook;
+- call the CPU-level update before schedtune_dequeue_task() so schedutil
+  does not observe the stale root cfs_rq estimate.
+
+This is patch 2/4 of the util_est correctness backport.
+
+Signed-off-by: Xuewen Yan <xuewen.yan@unisoc.com>
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+---
+ kernel/sched/fair.c | 38 ++++++++++++++++++++++++++------------
+ 1 file changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3aa273f02da15db1f3ad910d8ce3c499efaa5099..108c09fcb26bb806c18af27061cb8f10f917d974 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3758,6 +3758,22 @@ static inline void util_est_enqueue(struct cfs_rq *cfs_rq,
+ 	trace_sched_util_est_cpu(cpu_of(rq_of(cfs_rq)), cfs_rq);
+ }
+ 
++static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
++				    struct task_struct *p)
++{
++	unsigned int enqueued;
++
++	if (!sched_feat(UTIL_EST))
++		return;
++
++	/* Update root cfs_rq's estimated utilization */
++	enqueued  = cfs_rq->avg.util_est.enqueued;
++	enqueued -= min_t(unsigned int, enqueued, _task_util_est(p));
++	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, enqueued);
++
++	trace_sched_util_est_cpu(cpu_of(rq_of(cfs_rq)), cfs_rq);
++}
++
+ /*
+  * Check if a (signed) value is within a specified (unsigned) margin,
+  * based on the observation that:
+@@ -3771,8 +3787,9 @@ static inline bool within_margin(int value, int margin)
+ 	return ((unsigned int)(value + margin - 1) < (2 * margin - 1));
+ }
+ 
+-static void
+-util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p, bool task_sleep)
++static inline void util_est_update(struct cfs_rq *cfs_rq,
++				   struct task_struct *p,
++				   bool task_sleep)
+ {
+ 	long last_ewma_diff;
+ 	struct util_est ue;
+@@ -3780,13 +3797,6 @@ util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p, bool task_sleep)
+ 	if (!sched_feat(UTIL_EST))
+ 		return;
+ 
+-	/* Update root cfs_rq's estimated utilization */
+-	ue.enqueued  = cfs_rq->avg.util_est.enqueued;
+-	ue.enqueued -= min_t(unsigned int, ue.enqueued, _task_util_est(p));
+-	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, ue.enqueued);
+-
+-	trace_sched_util_est_cpu(cpu_of(rq_of(cfs_rq)), cfs_rq);
+-
+ 	/*
+ 	 * Skip update of task's estimated utilization when the task has not
+ 	 * yet completed an activation, e.g. being migrated.
+@@ -3879,8 +3889,11 @@ static inline void
+ util_est_enqueue(struct cfs_rq *cfs_rq, struct task_struct *p) {}
+ 
+ static inline void
+-util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p,
+-		 bool task_sleep) {}
++util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p) {}
++
++static inline void
++util_est_update(struct cfs_rq *cfs_rq, struct task_struct *p,
++		bool task_sleep) {}
+ 
+ #endif /* CONFIG_SMP */
+ 
+@@ -5434,6 +5447,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	 * Let's update schedtune here to ensure the boost value of the
+ 	 * current task is not more accounted for in the selection of the OPP.
+ 	 */
++	util_est_dequeue(&rq->cfs, p);
+ 	schedtune_dequeue_task(p, cpu_of(rq));
+ 
+ 	for_each_sched_entity(se) {
+@@ -5483,7 +5497,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 		walt_dec_cumulative_runnable_avg(rq, p);
+ 	}
+ 
+-	util_est_dequeue(&rq->cfs, p, task_sleep);
++	util_est_update(&rq->cfs, p, task_sleep);
+ 	dequeue_multi_load(&rq->cfs, p, task_sleep);
+ 	hrtick_update(rq);
+ }
+-- 
+2.54.0
+
+
+From c9d367e3031fbee502e76f6ef43f96013d8d0901 Mon Sep 17 00:00:00 2001
+From: Vincent Donnefort <vincent.donnefort@arm.com>
+Date: Thu, 25 Feb 2021 16:58:20 +0000
+Subject: [PATCH 3/4] BACKPORT: sched/pelt: Fix task util_est update filtering
+
+util_est reduces the number of its updates by filtering out samples
+whose EWMA differs from the task util_avg by less than 1%. That filter
+can miss a sudden util_avg ramp-up: the decaying EWMA can be close to
+the new util_avg while ue.enqueued still holds the old activation value.
+
+Take both util_est members into account. If the EWMA difference is
+within the margin but the enqueued value is not, continue to the update
+path instead of returning early.
+
+Backported from: b89997aa88f0b07d8a6414c908af75062103b8c9
+("sched/pelt: Fix task util_est update filtering") by Vincent Donnefort.
+Source: upstream Linux (torvalds/linux).
+
+Adapted for the Exynos9820 4.14 tree:
+- the target does not carry the adjacent upstream EWMA-reset or
+  UTIL_EST_FASTUP changes; only the filtering fix is ported here;
+- the target's util_est_update() also lacks the later capacity check,
+  so no unrelated check is introduced;
+- UTIL_AVG_UNCHANGED is still the low-bit flag at this point; the
+  following 68d7a190682a commit moves it to the MSB and fixes the
+  enqueued-difference accounting.
+
+This is patch 3/4 of the util_est correctness backport.
+
+Signed-off-by: Vincent Donnefort <vincent.donnefort@arm.com>
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+---
+ kernel/sched/fair.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 108c09fcb26bb806c18af27061cb8f10f917d974..d5268cb3e1d7e515a42c83ef1c0c7089a0be7db6 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3774,6 +3774,8 @@ static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
+ 	trace_sched_util_est_cpu(cpu_of(rq_of(cfs_rq)), cfs_rq);
+ }
+ 
++#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
++
+ /*
+  * Check if a (signed) value is within a specified (unsigned) margin,
+  * based on the observation that:
+@@ -3791,7 +3793,7 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
+ 				   struct task_struct *p,
+ 				   bool task_sleep)
+ {
+-	long last_ewma_diff;
++	long last_ewma_diff, last_enqueued_diff;
+ 	struct util_est ue;
+ 
+ 	if (!sched_feat(UTIL_EST))
+@@ -3812,14 +3814,21 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
+ 	if (ue.enqueued & UTIL_AVG_UNCHANGED)
+ 		return;
+ 
++	last_enqueued_diff = ue.enqueued;
++
+ 	/*
+-	 * Skip update of task's estimated utilization when its EWMA is
++	 * Skip update of task's estimated utilization when its members are
+ 	 * already ~1% close to its last activation value.
+ 	 */
+ 	ue.enqueued = (task_util(p) | UTIL_AVG_UNCHANGED);
+ 	last_ewma_diff = ue.enqueued - ue.ewma;
+-	if (within_margin(last_ewma_diff, (SCHED_CAPACITY_SCALE / 100)))
++	last_enqueued_diff -= ue.enqueued;
++	if (within_margin(last_ewma_diff, UTIL_EST_MARGIN)) {
++		if (!within_margin(last_enqueued_diff, UTIL_EST_MARGIN))
++			goto done;
++
+ 		return;
++	}
+ 
+ 	/*
+ 	 * Update Task's estimated utilization
+@@ -3841,6 +3850,7 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
+ 	ue.ewma <<= UTIL_EST_WEIGHT_SHIFT;
+ 	ue.ewma  += last_ewma_diff;
+ 	ue.ewma >>= UTIL_EST_WEIGHT_SHIFT;
++done:
+ 	WRITE_ONCE(p->se.avg.util_est, ue);
+ 
+ 	trace_sched_util_est_task(p, &p->se.avg);
+-- 
+2.54.0
+
+
+From 84b5bb1063dd75817b60104894dfe054a9e046fe Mon Sep 17 00:00:00 2001
+From: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Date: Wed, 2 Jun 2021 16:58:08 +0200
+Subject: [PATCH 4/4] BACKPORT: sched/fair: Fix util_est UTIL_AVG_UNCHANGED
+ handling
+
+UTIL_AVG_UNCHANGED currently uses the LSB of util_est.enqueued and is
+exposed through _task_util_est() and task_util_est(). With
+SCHED_FEAT(UTIL_EST, true), task_util_est() can therefore never return
+zero, which breaks the early-exit in find_energy_efficient_cpu().
+
+It also makes util_est_update() subtract the flag only from the new
+enqueued value, corrupting last_enqueued_diff.
+
+Move the flag to the MSB of util_est.enqueued, keep it internal to
+util_est and mask it whenever the task's enqueued value is published.
+At dequeue time, store the real task util first and set the flag only on
+the final WRITE_ONCE().
+
+Backported from: 68d7a190682aa4eb02db477328088ebad15acc83
+("sched/fair: Fix util_est UTIL_AVG_UNCHANGED handling") by Dietmar
+Eggemann.
+Source: upstream Linux (torvalds/linux).
+Fixes: b89997aa88f0 ("sched/pelt: Fix task util_est update filtering").
+
+Adapted for the Exynos9820 4.14 tree:
+- the target defines UTIL_AVG_UNCHANGED in fair.c and has no
+  kernel/sched/pelt.h; remove the LSB definition from fair.c and put the
+  MSB definition beside struct util_est in include/linux/sched.h;
+- mask the flag in sched_debug output and in the local
+  trace_sched_util_est_task event so neither exposes the MSB;
+- the Samsung multi-load tracker keeps its independent LSB flag, renamed
+  to ML_UTIL_AVG_UNCHANGED to avoid colliding with the new global macro;
+  its behaviour is unchanged;
+- no UTIL_EST_FASTUP or capacity-check code is imported with this fix.
+
+This is patch 4/4 of the util_est correctness backport.
+
+Signed-off-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+---
+ include/linux/sched.h         |  8 ++++++++
+ include/trace/events/sched.h  |  3 ++-
+ kernel/sched/debug.c          |  5 ++++-
+ kernel/sched/ems/multi_load.c | 18 +++++++++---------
+ kernel/sched/fair.c           | 16 ++++------------
+ 5 files changed, 27 insertions(+), 23 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 6dac7885ee31bab1dbbc8e91d638b93feea89a5e..2471e07ddd37b79ff092e20fe7961c31d9a20ba7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -348,11 +348,19 @@ struct load_weight {
+  * Only for tasks we track a moving average of the past instantaneous
+  * estimated utilization. This allows to absorb sporadic drops in utilization
+  * of an otherwise almost periodic task.
++ *
++ * The UTIL_AVG_UNCHANGED flag is used to synchronize util_est with util_avg
++ * updates. When a task is dequeued, its util_est should not be updated if its
++ * util_avg has not been updated in the meantime.
++ * This information is mapped into the MSB bit of util_est.enqueued at dequeue
++ * time. Since max value of util_est.enqueued for a task is 1024 (PELT util_avg
++ * for a task) it is safe to use MSB.
+  */
+ struct util_est {
+ 	unsigned int			enqueued;
+ 	unsigned int			ewma;
+ #define UTIL_EST_WEIGHT_SHIFT		2
++#define UTIL_AVG_UNCHANGED		0x80000000
+ } __attribute__((__aligned__(sizeof(u64))));
+ 
+ struct multi_load {
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index 18eed9118970973548cb338f7da9e071a66d3478..849b5a64abc50d2324c3191e7087c2152a757519 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -1280,7 +1280,8 @@ TRACE_EVENT(sched_util_est_task,
+ 		__entry->pid			= tsk->pid;
+ 		__entry->cpu                    = task_cpu(tsk);
+ 		__entry->util_avg               = avg->util_avg;
+-		__entry->est_enqueued           = avg->util_est.enqueued;
++		__entry->est_enqueued           = avg->util_est.enqueued &
++						  ~UTIL_AVG_UNCHANGED;
+ 		__entry->est_ewma               = avg->util_est.ewma;
+ 	),
+ 
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 7d275e07b139feb4c25363d6f01cb37482f5d3b2..7eda1557d27dc64ff81549d206e6c141ff44fa1d 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -944,6 +944,8 @@ __initcall(init_sched_debug_procfs);
+ 	SEQ_printf(m, "%-45s:%21Ld\n", #F, (long long)F)
+ #define P(F) \
+ 	SEQ_printf(m, "%-45s:%21Ld\n", #F, (long long)p->F)
++#define PM(F, M) \
++	SEQ_printf(m, "%-45s:%21Ld\n", #F, (long long)(p->F & (M)))
+ #define __PN(F) \
+ 	SEQ_printf(m, "%-45s:%14Ld.%06ld\n", #F, SPLIT_NS((long long)F))
+ #define PN(F) \
+@@ -1070,7 +1072,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ 	P(se.avg.util_avg);
+ 	P(se.avg.last_update_time);
+ 	P(se.avg.util_est.ewma);
+-	P(se.avg.util_est.enqueued);
++	PM(se.avg.util_est.enqueued, ~UTIL_AVG_UNCHANGED);
+ #endif
+ 	P(policy);
+ 	P(prio);
+@@ -1082,6 +1084,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ #undef PN
+ #undef __PN
+ #undef P_SCHEDSTAT
++#undef PM
+ #undef P
+ #undef __P
+ 
+diff --git a/kernel/sched/ems/multi_load.c b/kernel/sched/ems/multi_load.c
+index c4992893120624d4bbbbed366311286526ab26e2..424bbe73e4789949fc3d17acc134236f7924ecc5 100644
+--- a/kernel/sched/ems/multi_load.c
++++ b/kernel/sched/ems/multi_load.c
+@@ -184,7 +184,7 @@ unsigned long ml_cpu_util_ratio(int cpu, int sse)
+ 					/ capacity_orig_of_sse(cpu, sse);
+ }
+ 
+-#define UTIL_AVG_UNCHANGED 0x1
++#define ML_UTIL_AVG_UNCHANGED 0x1
+ 
+ /*
+  * ml_cpu_util_wake - cpu utilization except waking task
+@@ -213,10 +213,10 @@ unsigned long ml_cpu_util_wake(int cpu, struct task_struct *p)
+ 		if (unlikely(task_on_rq_queued(p) || current == p)) {
+ 			if (p->sse) {
+ 				sse_util_est -= min_t(unsigned int, sse_util_est,
+-						(_ml_task_util_est(p) | UTIL_AVG_UNCHANGED));
++						(_ml_task_util_est(p) | ML_UTIL_AVG_UNCHANGED));
+ 			} else {
+ 				uss_util_est -= min_t(unsigned int, uss_util_est,
+-						(_ml_task_util_est(p) | UTIL_AVG_UNCHANGED));
++						(_ml_task_util_est(p) | ML_UTIL_AVG_UNCHANGED));
+ 			}
+ 		}
+ 
+@@ -586,11 +586,11 @@ void cfs_se_util_change_multi_load(struct task_struct *p, struct sched_avg *avg)
+ 
+ 	/* Avoid store if the flag has been already set */
+ 	enqueued = avg->ml.util_est.enqueued;
+-	if (!(enqueued & UTIL_AVG_UNCHANGED))
++	if (!(enqueued & ML_UTIL_AVG_UNCHANGED))
+ 		return;
+ 
+ 	/* Reset flag to report util_avg has been updated */
+-	enqueued &= ~UTIL_AVG_UNCHANGED;
++	enqueued &= ~ML_UTIL_AVG_UNCHANGED;
+ 	WRITE_ONCE(avg->ml.util_est.enqueued, enqueued);
+ }
+ 
+@@ -612,7 +612,7 @@ void enqueue_multi_load(struct cfs_rq *cfs_rq,
+ 
+ 	/* Update root cfs_rq's estimated utilization */
+ 	enqueued  = cfs_rq_ue->enqueued;
+-	enqueued += (_ml_task_util_est(p) | UTIL_AVG_UNCHANGED);
++	enqueued += (_ml_task_util_est(p) | ML_UTIL_AVG_UNCHANGED);
+ 	WRITE_ONCE(cfs_rq_ue->enqueued, enqueued);
+ 
+ 	/* Update plots for Task and CPU estimated utilization */
+@@ -653,7 +653,7 @@ dequeue_multi_load(struct cfs_rq *cfs_rq, struct task_struct *p, bool task_sleep
+ 	if (cfs_rq->nr_running) {
+ 		ue.enqueued  = cfs_rq_ue->enqueued;
+ 		ue.enqueued -= min_t(unsigned int, ue.enqueued,
+-				     (_ml_task_util_est(p) | UTIL_AVG_UNCHANGED));
++				     (_ml_task_util_est(p) | ML_UTIL_AVG_UNCHANGED));
+ 	}
+ 	WRITE_ONCE(cfs_rq_ue->enqueued, ue.enqueued);
+ 
+@@ -675,14 +675,14 @@ dequeue_multi_load(struct cfs_rq *cfs_rq, struct task_struct *p, bool task_sleep
+ 	 * skip the util_est update.
+ 	 */
+ 	ue = p->se.avg.ml.util_est;
+-	if (ue.enqueued & UTIL_AVG_UNCHANGED)
++	if (ue.enqueued & ML_UTIL_AVG_UNCHANGED)
+ 		return;
+ 
+ 	/*
+ 	 * Skip update of task's estimated utilization when its EWMA is
+ 	 * already ~1% close to its last activation value.
+ 	 */
+-	ue.enqueued = (ml_task_util(p) | UTIL_AVG_UNCHANGED);
++	ue.enqueued = (ml_task_util(p) | ML_UTIL_AVG_UNCHANGED);
+ 	last_ewma_diff = ue.enqueued - ue.ewma;
+ 	if (within_margin(last_ewma_diff, capacity_orig_of(task_cpu(p)) / 100))
+ 		return;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d5268cb3e1d7e515a42c83ef1c0c7089a0be7db6..7c9417fbd1580a272e36f4fea5aa918ff8ccb5fd 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3097,15 +3097,6 @@ ___update_load_avg(u64 now, int cpu, struct sched_avg *sa,
+ 	return 1;
+ }
+ 
+-/*
+- * When a task is dequeued, its estimated utilization should not be update if
+- * its util_avg has not been updated at least once.
+- * This flag is used to synchronize util_avg updates with util_est updates.
+- * We map this information into the LSB bit of the utilization saved at
+- * dequeue time (i.e. util_est.dequeued).
+- */
+-#define UTIL_AVG_UNCHANGED 0x1
+-
+ static inline void cfs_se_util_change(struct sched_avg *avg)
+ {
+ 	unsigned int enqueued;
+@@ -3113,7 +3104,7 @@ static inline void cfs_se_util_change(struct sched_avg *avg)
+ 	if (!sched_feat(UTIL_EST))
+ 		return;
+ 
+-	/* Avoid store if the flag has been already set */
++	/* Avoid store if the flag has been already reset */
+ 	enqueued = avg->util_est.enqueued;
+ 	if (!(enqueued & UTIL_AVG_UNCHANGED))
+ 		return;
+@@ -3728,7 +3719,7 @@ static inline unsigned long _task_util_est(struct task_struct *p)
+ {
+ 	struct util_est ue = READ_ONCE(p->se.avg.util_est);
+ 
+-	return (max(ue.ewma, ue.enqueued) | UTIL_AVG_UNCHANGED);
++	return max(ue.ewma, (ue.enqueued & ~UTIL_AVG_UNCHANGED));
+ }
+ 
+ static inline unsigned long task_util_est(struct task_struct *p)
+@@ -3820,7 +3811,7 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
+ 	 * Skip update of task's estimated utilization when its members are
+ 	 * already ~1% close to its last activation value.
+ 	 */
+-	ue.enqueued = (task_util(p) | UTIL_AVG_UNCHANGED);
++	ue.enqueued = task_util(p);
+ 	last_ewma_diff = ue.enqueued - ue.ewma;
+ 	last_enqueued_diff -= ue.enqueued;
+ 	if (within_margin(last_ewma_diff, UTIL_EST_MARGIN)) {
+@@ -3851,6 +3842,7 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
+ 	ue.ewma  += last_ewma_diff;
+ 	ue.ewma >>= UTIL_EST_WEIGHT_SHIFT;
+ done:
++	ue.enqueued |= UTIL_AVG_UNCHANGED;
+ 	WRITE_ONCE(p->se.avg.util_est, ue);
+ 
+ 	trace_sched_util_est_task(p, &p->se.avg);
+-- 
+2.54.0
+

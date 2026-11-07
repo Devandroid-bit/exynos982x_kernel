@@ -1,0 +1,157 @@
+name: Apply sched util_est backports
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to update (must match the fixed target below)"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sched-util-est-backports-ack-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: devandroid-droidspaces-mglru-backports-ack
+  BASE_SHA: b3199fdac1bdd8858a723db84adc58e6397d0e64
+  PATCH_PATH: .github/workflows/sched-util-est-backports-ack.patch
+  WORKFLOW_PATH: .github/workflows/apply-sched-util-est-backports-ack.yml
+  PATCH_SHA256: 47d4e6d80e19df575f5dea3cdda38e0a287055e957bb5f7779c2074289df32c6
+  SOURCE_TREE: e4001191fd9eebf79fee622c613072670320addc
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout dispatch ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate target branch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$TARGET_BRANCH" = "devandroid-droidspaces-mglru-backports-ack"
+
+      - name: Verify patch and base commit
+        run: |
+          set -euo pipefail
+          test -f "$PATCH_PATH"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test "$(grep -c '^From [0-9a-f]\{40\} ' "$PATCH_PATH")" -eq 4
+          git cat-file -e "$BASE_SHA^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" "$GITHUB_SHA"
+
+      - name: Apply and verify backport
+        run: |
+          set -euo pipefail
+          APPLY_DIR="$RUNNER_TEMP/sched-util-est-apply"
+          rm -rf "$APPLY_DIR"
+          git worktree add --detach "$APPLY_DIR" "$BASE_SHA"
+          git -C "$APPLY_DIR" config user.name "github-actions[bot]"
+          git -C "$APPLY_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git -C "$APPLY_DIR" am --keep-cr "$GITHUB_WORKSPACE/$PATCH_PATH"
+          test "$(git -C "$APPLY_DIR" rev-list --count "$BASE_SHA..HEAD")" -eq 4
+
+          cat > "$RUNNER_TEMP/expected-subjects" <<'EOF'
+          BACKPORT: sched/fair: Mask UTIL_AVG_UNCHANGED usages
+          BACKPORT: sched/fair: Avoid stale CPU util_est value for schedutil in task dequeue
+          BACKPORT: sched/pelt: Fix task util_est update filtering
+          BACKPORT: sched/fair: Fix util_est UTIL_AVG_UNCHANGED handling
+          EOF
+          git -C "$APPLY_DIR" log --reverse --format='%s' "$BASE_SHA..HEAD" > "$RUNNER_TEMP/actual-subjects"
+          diff -u "$RUNNER_TEMP/expected-subjects" "$RUNNER_TEMP/actual-subjects"
+
+          cat > "$RUNNER_TEMP/expected-authors" <<'EOF'
+          Patrick Bellasi <patrick.bellasi@arm.com>
+          Xuewen Yan <xuewen.yan@unisoc.com>
+          Vincent Donnefort <vincent.donnefort@arm.com>
+          Dietmar Eggemann <dietmar.eggemann@arm.com>
+          EOF
+          git -C "$APPLY_DIR" log --reverse --format='%an <%ae>' "$BASE_SHA..HEAD" > "$RUNNER_TEMP/actual-authors"
+          diff -u "$RUNNER_TEMP/expected-authors" "$RUNNER_TEMP/actual-authors"
+
+          test "$(git -C "$APPLY_DIR" log "$BASE_SHA..HEAD" --format=%B | grep -c '^Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>$')" -eq 4
+          for TRAILER in \
+            "Patrick Bellasi <patrick.bellasi@arm.com>" \
+            "Xuewen Yan <xuewen.yan@unisoc.com>" \
+            "Vincent Donnefort <vincent.donnefort@arm.com>" \
+            "Dietmar Eggemann <dietmar.eggemann@arm.com>"; do
+            test "$(git -C "$APPLY_DIR" log "$BASE_SHA..HEAD" --format=%B | grep -Fxc "Signed-off-by: $TRAILER")" -eq 1
+          done
+
+          cat > "$RUNNER_TEMP/expected-files" <<'EOF'
+          include/linux/sched.h
+          include/trace/events/sched.h
+          kernel/sched/debug.c
+          kernel/sched/ems/multi_load.c
+          kernel/sched/fair.c
+          EOF
+          git -C "$APPLY_DIR" diff --name-only "$BASE_SHA..HEAD" > "$RUNNER_TEMP/actual-files"
+          diff -u "$RUNNER_TEMP/expected-files" "$RUNNER_TEMP/actual-files"
+
+          test "$(git -C "$APPLY_DIR" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+
+          git -C "$APPLY_DIR" checkout "$GITHUB_SHA" -- "$WORKFLOW_PATH" "$PATCH_PATH"
+          git -C "$APPLY_DIR" commit -m "git-git-actions: add sched util_est backport workflow"
+
+          test -z "$(git -C "$APPLY_DIR" status --short)"
+          test "$(sha256sum "$APPLY_DIR/$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git -C "$APPLY_DIR" diff --quiet "$SOURCE_TREE" HEAD -- . ':(exclude).github/workflows'
+
+          cat > "$RUNNER_TEMP/expected-final-files" <<'EOF'
+          .github/workflows/apply-sched-util-est-backports-ack.yml
+          .github/workflows/sched-util-est-backports-ack.patch
+          include/linux/sched.h
+          include/trace/events/sched.h
+          kernel/sched/debug.c
+          kernel/sched/ems/multi_load.c
+          kernel/sched/fair.c
+          EOF
+          git -C "$APPLY_DIR" diff --name-only "$BASE_SHA..HEAD" | LC_ALL=C sort > "$RUNNER_TEMP/actual-final-files"
+          LC_ALL=C sort "$RUNNER_TEMP/expected-final-files" > "$RUNNER_TEMP/expected-final-files.sorted"
+          diff -u "$RUNNER_TEMP/expected-final-files.sorted" "$RUNNER_TEMP/actual-final-files"
+
+          git -C "$APPLY_DIR" log --oneline "$BASE_SHA..HEAD"
+          echo "APPLY_DIR=$APPLY_DIR" >> "$GITHUB_ENV"
+          echo "APPLIED_HEAD=$(git -C "$APPLY_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Push target branch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          git -C "$APPLY_DIR" fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          REMOTE_SHA=$(git -C "$APPLY_DIR" rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+          HEAD_SHA=$(git -C "$APPLY_DIR" rev-parse HEAD)
+
+          if [ "$REMOTE_SHA" = "$HEAD_SHA" ]; then
+            echo "Target branch already has the expected commit; nothing to push."
+          elif git -C "$APPLY_DIR" diff --quiet "$REMOTE_SHA" "$HEAD_SHA"; then
+            echo "Target branch already has the expected tree; nothing to push."
+          else
+            git -C "$APPLY_DIR" merge-base --is-ancestor "$BASE_SHA" "$REMOTE_SHA"
+            if ! git -C "$APPLY_DIR" merge-base --is-ancestor "$REMOTE_SHA" "$HEAD_SHA"; then
+              echo "::error::Target branch has diverged from the expected base; refusing to push."
+              exit 1
+            fi
+            git -C "$APPLY_DIR" push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          fi
+
+          echo "### sched util_est backports applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Patch SHA256: \`${PATCH_SHA256}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits:" >> "$GITHUB_STEP_SUMMARY"
+          git -C "$APPLY_DIR" log --format='- `%h` %s' "$BASE_SHA..HEAD" >> "$GITHUB_STEP_SUMMARY"
