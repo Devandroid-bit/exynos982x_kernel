@@ -28,40 +28,117 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout dispatch ref
+      - name: Checkout dispatched target commit
         uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Validate target branch
+      - name: Validate target, patch, and base
         env:
           TARGET_INPUT: ${{ inputs.target_branch }}
         run: |
           set -euo pipefail
           test "$TARGET_INPUT" = "$TARGET_BRANCH"
           test "$TARGET_BRANCH" = "devandroid-droidspaces-mglru-backports-ack"
-
-      - name: Verify patch and base commit
-        run: |
-          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/${TARGET_BRANCH}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -f "$PATCH_PATH"
           test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
           test "$(grep -c '^From [0-9a-f]\{40\} ' "$PATCH_PATH")" -eq 4
-          git cat-file -e "$BASE_SHA^{commit}"
-          git merge-base --is-ancestor "$BASE_SHA" "$GITHUB_SHA"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test -z "$(git status --porcelain)"
 
-      - name: Apply and verify backport
+      - name: Detect target state
         run: |
           set -euo pipefail
-          APPLY_DIR="$RUNNER_TEMP/sched-util-est-apply"
-          rm -rf "$APPLY_DIR"
-          git worktree add --detach "$APPLY_DIR" "$BASE_SHA"
-          git -C "$APPLY_DIR" config user.name "github-actions[bot]"
-          git -C "$APPLY_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          START_SHA=$(git rev-parse HEAD)
+          BASE_FILES="$RUNNER_TEMP/expected-control-files"
+          ACTUAL_BASE_FILES="$RUNNER_TEMP/actual-control-files"
+          FINAL_FILES="$RUNNER_TEMP/expected-final-files"
+          ACTUAL_FINAL_FILES="$RUNNER_TEMP/actual-final-files"
 
-          git -C "$APPLY_DIR" am --keep-cr "$GITHUB_WORKSPACE/$PATCH_PATH"
-          test "$(git -C "$APPLY_DIR" rev-list --count "$BASE_SHA..HEAD")" -eq 4
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" | LC_ALL=C sort > "$BASE_FILES"
+
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" \
+            "include/linux/sched.h" \
+            "include/trace/events/sched.h" \
+            "kernel/sched/debug.c" \
+            "kernel/sched/ems/multi_load.c" \
+            "kernel/sched/fair.c" | LC_ALL=C sort > "$FINAL_FILES"
+
+          git diff --name-only "$BASE_SHA" "$START_SHA" | LC_ALL=C sort > "$ACTUAL_BASE_FILES"
+
+          if cmp -s "$BASE_FILES" "$ACTUAL_BASE_FILES" &&
+             git diff --quiet "$BASE_SHA" "$START_SHA" -- . ':(exclude).github/workflows'; then
+            STATE=apply
+            VERIFY_BASE=$START_SHA
+          else
+            diff -u "$FINAL_FILES" "$ACTUAL_BASE_FILES"
+            git diff --quiet "$SOURCE_TREE" "$START_SHA" -- . ':(exclude).github/workflows'
+            VERIFY_BASE=$(git rev-parse "${START_SHA}~4")
+            test "$(git rev-list --count "$VERIFY_BASE..$START_SHA")" -eq 4
+            STATE=already-applied
+          fi
+
+          echo "START_SHA=$START_SHA" >> "$GITHUB_ENV"
+          echo "VERIFY_BASE=$VERIFY_BASE" >> "$GITHUB_ENV"
+          echo "STATE=$STATE" >> "$GITHUB_ENV"
+          echo "Detected state: $STATE"
+          echo "Start commit: $START_SHA"
+          echo "Backport base: $VERIFY_BASE"
+
+      - name: Apply patch in place
+        if: env.STATE == 'apply'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git am --keep-cr "$PATCH_PATH"; then
+            git am --abort || true
+            exit 1
+          fi
+
+      - name: Verify four backports
+        run: |
+          set -euo pipefail
+          test -n "$VERIFY_BASE"
+          test "$(git rev-list --count "$VERIFY_BASE..HEAD")" -eq 4
+          test "$(git rev-list --merges --count "$VERIFY_BASE..HEAD")" -eq 0
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git diff --check "$VERIFY_BASE" HEAD
+          git diff --quiet "$START_SHA" HEAD -- .github/workflows
+
+          SOURCE_FILES="$RUNNER_TEMP/expected-source-files"
+          ACTUAL_SOURCE_FILES="$RUNNER_TEMP/actual-source-files"
+          printf '%s\n' \
+            "include/linux/sched.h" \
+            "include/trace/events/sched.h" \
+            "kernel/sched/debug.c" \
+            "kernel/sched/ems/multi_load.c" \
+            "kernel/sched/fair.c" | LC_ALL=C sort > "$SOURCE_FILES"
+          git diff --name-only "$VERIFY_BASE" HEAD | LC_ALL=C sort > "$ACTUAL_SOURCE_FILES"
+          diff -u "$SOURCE_FILES" "$ACTUAL_SOURCE_FILES"
+          git diff --quiet "$SOURCE_TREE" HEAD -- . ':(exclude).github/workflows'
+
+          FINAL_FILES="$RUNNER_TEMP/expected-final-files"
+          ACTUAL_FINAL_FILES="$RUNNER_TEMP/actual-final-files"
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" \
+            "include/linux/sched.h" \
+            "include/trace/events/sched.h" \
+            "kernel/sched/debug.c" \
+            "kernel/sched/ems/multi_load.c" \
+            "kernel/sched/fair.c" | LC_ALL=C sort > "$FINAL_FILES"
+          git diff --name-only "$BASE_SHA" HEAD | LC_ALL=C sort > "$ACTUAL_FINAL_FILES"
+          diff -u "$FINAL_FILES" "$ACTUAL_FINAL_FILES"
 
           cat > "$RUNNER_TEMP/expected-subjects" <<'EOF'
           BACKPORT: sched/fair: Mask UTIL_AVG_UNCHANGED usages
@@ -69,7 +146,7 @@ jobs:
           BACKPORT: sched/pelt: Fix task util_est update filtering
           BACKPORT: sched/fair: Fix util_est UTIL_AVG_UNCHANGED handling
           EOF
-          git -C "$APPLY_DIR" log --reverse --format='%s' "$BASE_SHA..HEAD" > "$RUNNER_TEMP/actual-subjects"
+          git log --reverse --format='%s' "$VERIFY_BASE..HEAD" > "$RUNNER_TEMP/actual-subjects"
           diff -u "$RUNNER_TEMP/expected-subjects" "$RUNNER_TEMP/actual-subjects"
 
           cat > "$RUNNER_TEMP/expected-authors" <<'EOF'
@@ -78,53 +155,27 @@ jobs:
           Vincent Donnefort <vincent.donnefort@arm.com>
           Dietmar Eggemann <dietmar.eggemann@arm.com>
           EOF
-          git -C "$APPLY_DIR" log --reverse --format='%an <%ae>' "$BASE_SHA..HEAD" > "$RUNNER_TEMP/actual-authors"
+          git log --reverse --format='%an <%ae>' "$VERIFY_BASE..HEAD" > "$RUNNER_TEMP/actual-authors"
           diff -u "$RUNNER_TEMP/expected-authors" "$RUNNER_TEMP/actual-authors"
 
-          test "$(git -C "$APPLY_DIR" log "$BASE_SHA..HEAD" --format=%B | grep -c '^Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>$')" -eq 4
+          git log "$VERIFY_BASE..HEAD" --format=%B > "$RUNNER_TEMP/commit-bodies"
+          test "$(grep -Fxc 'Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>' "$RUNNER_TEMP/commit-bodies")" -eq 4
           for TRAILER in \
             "Patrick Bellasi <patrick.bellasi@arm.com>" \
             "Xuewen Yan <xuewen.yan@unisoc.com>" \
             "Vincent Donnefort <vincent.donnefort@arm.com>" \
             "Dietmar Eggemann <dietmar.eggemann@arm.com>"; do
-            test "$(git -C "$APPLY_DIR" log "$BASE_SHA..HEAD" --format=%B | grep -Fxc "Signed-off-by: $TRAILER")" -eq 1
+            test "$(grep -Fxc "Signed-off-by: $TRAILER" "$RUNNER_TEMP/commit-bodies")" -eq 1
+          done
+          for UPSTREAM_SHA in \
+            92a801e5d5b7a893881c1676b15dd246727ccd16 \
+            8c1f560c1ea3f19e22ba356f62680d9d449c9ec2 \
+            b89997aa88f0b07d8a6414c908af75062103b8c9 \
+            68d7a190682aa4eb02db477328088ebad15acc83; do
+            test "$(grep -Fc "Backported from: $UPSTREAM_SHA" "$RUNNER_TEMP/commit-bodies")" -eq 1
           done
 
-          cat > "$RUNNER_TEMP/expected-files" <<'EOF'
-          include/linux/sched.h
-          include/trace/events/sched.h
-          kernel/sched/debug.c
-          kernel/sched/ems/multi_load.c
-          kernel/sched/fair.c
-          EOF
-          git -C "$APPLY_DIR" diff --name-only "$BASE_SHA..HEAD" > "$RUNNER_TEMP/actual-files"
-          diff -u "$RUNNER_TEMP/expected-files" "$RUNNER_TEMP/actual-files"
-
-          test "$(git -C "$APPLY_DIR" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
-
-          git -C "$APPLY_DIR" checkout "$GITHUB_SHA" -- "$WORKFLOW_PATH" "$PATCH_PATH"
-          git -C "$APPLY_DIR" commit -m "git-git-actions: add sched util_est backport workflow"
-
-          test -z "$(git -C "$APPLY_DIR" status --short)"
-          test "$(sha256sum "$APPLY_DIR/$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
-          git -C "$APPLY_DIR" diff --quiet "$SOURCE_TREE" HEAD -- . ':(exclude).github/workflows'
-
-          cat > "$RUNNER_TEMP/expected-final-files" <<'EOF'
-          .github/workflows/apply-sched-util-est-backports-ack.yml
-          .github/workflows/sched-util-est-backports-ack.patch
-          include/linux/sched.h
-          include/trace/events/sched.h
-          kernel/sched/debug.c
-          kernel/sched/ems/multi_load.c
-          kernel/sched/fair.c
-          EOF
-          git -C "$APPLY_DIR" diff --name-only "$BASE_SHA..HEAD" | LC_ALL=C sort > "$RUNNER_TEMP/actual-final-files"
-          LC_ALL=C sort "$RUNNER_TEMP/expected-final-files" > "$RUNNER_TEMP/expected-final-files.sorted"
-          diff -u "$RUNNER_TEMP/expected-final-files.sorted" "$RUNNER_TEMP/actual-final-files"
-
-          git -C "$APPLY_DIR" log --oneline "$BASE_SHA..HEAD"
-          echo "APPLY_DIR=$APPLY_DIR" >> "$GITHUB_ENV"
-          echo "APPLIED_HEAD=$(git -C "$APPLY_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
+          git log --oneline "$VERIFY_BASE..HEAD"
 
       - name: Push target branch
         env:
@@ -132,26 +183,36 @@ jobs:
         run: |
           set -euo pipefail
           test "$TARGET_INPUT" = "$TARGET_BRANCH"
-          git -C "$APPLY_DIR" fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
-          REMOTE_SHA=$(git -C "$APPLY_DIR" rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
-          HEAD_SHA=$(git -C "$APPLY_DIR" rev-parse HEAD)
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          REMOTE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+          HEAD_SHA=$(git rev-parse HEAD)
 
           if [ "$REMOTE_SHA" = "$HEAD_SHA" ]; then
+            RESULT_SHA=$REMOTE_SHA
             echo "Target branch already has the expected commit; nothing to push."
-          elif git -C "$APPLY_DIR" diff --quiet "$REMOTE_SHA" "$HEAD_SHA"; then
-            echo "Target branch already has the expected tree; nothing to push."
+          elif [ "$REMOTE_SHA" = "$START_SHA" ]; then
+            git merge-base --is-ancestor "$REMOTE_SHA" "$HEAD_SHA"
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+            test "$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")" = "$HEAD_SHA"
+            RESULT_SHA=$HEAD_SHA
+          elif git merge-base --is-ancestor "$START_SHA" "$REMOTE_SHA" &&
+               test "$(git rev-list --count "$START_SHA..$REMOTE_SHA")" -eq 4 &&
+               git diff --quiet "$SOURCE_TREE" "$REMOTE_SHA" -- . ':(exclude).github/workflows' &&
+               git diff --quiet "$START_SHA" "$REMOTE_SHA" -- .github/workflows; then
+            RESULT_SHA=$REMOTE_SHA
+            echo "Target branch already has the expected backports; nothing to push."
           else
-            git -C "$APPLY_DIR" merge-base --is-ancestor "$BASE_SHA" "$REMOTE_SHA"
-            if ! git -C "$APPLY_DIR" merge-base --is-ancestor "$REMOTE_SHA" "$HEAD_SHA"; then
-              echo "::error::Target branch has diverged from the expected base; refusing to push."
-              exit 1
-            fi
-            git -C "$APPLY_DIR" push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            echo "::error::Target branch changed during workflow; expected $START_SHA or $HEAD_SHA, found $REMOTE_SHA."
+            exit 1
           fi
 
           echo "### sched util_est backports applied" >> "$GITHUB_STEP_SUMMARY"
           echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- State: \`${STATE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Start commit: \`${START_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Result commit: \`${RESULT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Patch SHA256: \`${PATCH_SHA256}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Commits:" >> "$GITHUB_STEP_SUMMARY"
-          git -C "$APPLY_DIR" log --format='- `%h` %s' "$BASE_SHA..HEAD" >> "$GITHUB_STEP_SUMMARY"
+          git log --format='- `%h` %s' "$VERIFY_BASE..$RESULT_SHA" >> "$GITHUB_STEP_SUMMARY"
