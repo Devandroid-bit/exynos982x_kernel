@@ -109,6 +109,7 @@ jobs:
           printf '%s\n' \
             "Documentation/filesystems/f2fs.txt" \
             "fs/f2fs/data.c" \
+            "fs/f2fs/file.c" \
             "fs/f2fs/f2fs.h" \
             "fs/f2fs/gc.c" \
             "fs/f2fs/gc.h" \
@@ -131,6 +132,7 @@ jobs:
             "$PATCH_PATH" \
             "Documentation/filesystems/f2fs.txt" \
             "fs/f2fs/data.c" \
+            "fs/f2fs/file.c" \
             "fs/f2fs/f2fs.h" \
             "fs/f2fs/gc.c" \
             "fs/f2fs/gc.h" \
