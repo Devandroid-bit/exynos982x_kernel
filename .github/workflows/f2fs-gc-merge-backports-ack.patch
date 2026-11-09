@@ -1,0 +1,554 @@
+From cf95bc9c97327409d6fc834b7299f5594a63faac Mon Sep 17 00:00:00 2001
+From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 12:59:24 +0100
+Subject: [PATCH] BACKPORT: f2fs: introduce gc_merge mount option
+
+Backport the F2FS GC merge mount option from the Samsung Exynos 2400
+Linux 6.1 tree (android14-6.1-S921BXXSDCZB2), based on upstream commit
+5911d2d1d1a38b26585383478bd71d9254e48bdf.
+
+When enabled, the background GC thread handles foreground GC requests
+and merges them with ongoing background GC. This avoids slow foreground
+GC in a process context when free space is low and can reduce UI stalls
+during storage-heavy operations.
+
+Local compatibility changes for the Exynos9820 4.14 F2FS:
+- adapt to the target's 4-argument f2fs_gc() API;
+- use the target's f2fs_down_write()/f2fs_up_write() wrappers;
+- keep the target's GC urgent/sleep handling;
+- start the GC thread when gc_merge is set even if background_gc=off;
+- add the mount option and documentation to the target tree.
+
+Audit corrections:
+- wake foreground GC waiters on read-only, frozen-filesystem, and
+  sb_start_write_trylock() skip paths;
+- keep the published gc_thread allocation alive until superblock
+  teardown, use f2fs_gc_task as the running marker, and recheck it after
+  prepare_to_wait() to avoid finish_wait() on freed waitqueue storage;
+- submit cached OPU/IPU DATA bios before merged or direct foreground GC
+  to avoid the gc_merge DATA-bio deadlock;
+- do not run background GC when background_gc=off unless the request is
+  foreground or urgent.
+
+Final pre-application correction:
+- serialize GC-thread stop in the shutdown ioctl against remount and
+  other shutdown callers through sb->s_umount.
+
+Upstream commit: 5911d2d1d1a38b26585383478bd71d9254e48bdf
+Original-author: Chao Yu <yuchao0@huawei.com>
+Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Author: @Devandroid-bit.
+---
+ Documentation/filesystems/f2fs.txt |   6 +++
+ fs/f2fs/data.c                     |  25 +++++++++
+ fs/f2fs/file.c                     |   8 ++++++++
+ fs/f2fs/f2fs.h                     |   2 +
+ fs/f2fs/gc.c                       | 106 ++++++++++++++++++++++++++++---------
+ fs/f2fs/gc.h                       |  31 +++++++++++
+ fs/f2fs/segment.c                  |  24 ++++++++-
+ fs/f2fs/super.c                    |  34 ++++++++++--
+ 8 files changed, 205 insertions(+), 31 deletions(-)
+
+diff --git a/Documentation/filesystems/f2fs.txt b/Documentation/filesystems/f2fs.txt
+index 76603ab..753b024 100644
+--- a/Documentation/filesystems/f2fs.txt
++++ b/Documentation/filesystems/f2fs.txt
+@@ -106,6 +106,12 @@ background_gc=%s       Turn on/off cleaning operations, namely garbage
+                        on synchronous garbage collection running in background.
+                        Default value for this option is on. So garbage
+                        collection is on by default.
++gc_merge               When background_gc is on, this option can be enabled to
++                       let background GC thread handle foreground GC requests.
++                       It can eliminate the sluggish issue caused by slow
++                       foreground GC operation when GC is triggered from a
++                       process with limited I/O and CPU resources.
++nogc_merge             Disable GC merge feature.
+ disable_roll_forward   Disable the roll-forward recovery routine
+ norecovery             Disable the roll-forward recovery routine, mounted read-
+                        only (i.e., -o ro,disable_roll_forward)
+diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+index eef12b2..d9d2dcb 100644
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@ -960,6 +960,31 @@ void f2fs_submit_merged_ipu_write(struct f2fs_sb_info *sbi,
+ 	}
+ }
+ 
++void f2fs_submit_all_merged_ipu_writes(struct f2fs_sb_info *sbi)
++{
++	struct bio_entry *be, *tmp;
++	struct f2fs_bio_info *io;
++	enum temp_type temp;
++
++	for (temp = HOT; temp < NR_TEMP_TYPE; temp++) {
++		LIST_HEAD(list);
++
++		io = sbi->write_io[DATA] + temp;
++
++		if (list_empty(&io->bio_list))
++			continue;
++
++		f2fs_down_write(&io->bio_list_lock);
++		list_splice_init(&io->bio_list, &list);
++		f2fs_up_write(&io->bio_list_lock);
++
++		list_for_each_entry_safe(be, tmp, &list, list) {
++			__submit_bio(sbi, be->bio, DATA);
++			del_bio_entry(be);
++		}
++	}
++}
++
+ int f2fs_merge_page_bio(struct f2fs_io_info *fio)
+ {
+ 	struct bio *bio = *fio->bio;
+diff --git a/fs/f2fs/f2fs.h b/fs/f2fs/f2fs.h
+index 892040d..e9abe6b 100644
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@ -124,6 +124,7 @@ extern const char *f2fs_fault_name[FAULT_MAX];
+ #define F2FS_MOUNT_DISABLE_CHECKPOINT	0x02000000
+ #define F2FS_MOUNT_NORECOVERY		0x04000000
+ #define F2FS_MOUNT_ATGC			0x08000000
++#define	F2FS_MOUNT_GC_MERGE		0x20000000
+ 
+ #define F2FS_OPTION(sbi)	((sbi)->mount_opt)
+ #define clear_opt(sbi, option)	(F2FS_OPTION(sbi).opt &= ~F2FS_MOUNT_##option)
+@@ -3856,6 +3857,7 @@ void f2fs_submit_merged_write_cond(struct f2fs_sb_info *sbi,
+ 				nid_t ino, enum page_type type);
+ void f2fs_submit_merged_ipu_write(struct f2fs_sb_info *sbi,
+ 					struct bio **bio, struct page *page);
++void f2fs_submit_all_merged_ipu_writes(struct f2fs_sb_info *sbi);
+ void f2fs_flush_merged_writes(struct f2fs_sb_info *sbi);
+ int f2fs_submit_page_bio(struct f2fs_io_info *fio);
+ int f2fs_merge_page_bio(struct f2fs_io_info *fio);
+diff --git a/fs/f2fs/file.c b/fs/f2fs/file.c
+index e70f1eb..e1c266e 100644
+--- a/fs/f2fs/file.c
++++ b/fs/f2fs/file.c
+@@ -2356,11 +2356,19 @@ static int f2fs_ioc_shutdown(struct file *filp, unsigned long arg)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Remount and superblock teardown already hold s_umount for
++	 * writing. Take it here too so shutdown cannot race with remount
++	 * and other shutdown callers while starting or stopping the GC
++	 * thread.
++	 */
++	down_write(&sbi->sb->s_umount);
+ 	f2fs_stop_gc_thread(sbi);
+ 	f2fs_stop_discard_thread(sbi);
+ 
+ 	f2fs_drop_discard_cmd(sbi);
+ 	clear_opt(sbi, DISCARD);
++	up_write(&sbi->sb->s_umount);
+ 
+ 	f2fs_update_time(sbi, REQ_TIME);
+ out:
+diff --git a/fs/f2fs/gc.c b/fs/f2fs/gc.c
+index 2cd9c19..94d9dbd 100644
+--- a/fs/f2fs/gc.c
++++ b/fs/f2fs/gc.c
+@@ -28,19 +28,24 @@ static int gc_thread_func(void *data)
+ 	struct f2fs_sb_info *sbi = data;
+ 	struct f2fs_gc_kthread *gc_th = sbi->gc_thread;
+ 	wait_queue_head_t *wq = &sbi->gc_thread->gc_wait_queue_head;
++	wait_queue_head_t *fggc_wq = &sbi->gc_thread->fggc_wq;
+ 	unsigned int wait_ms;
+ 
+ 	wait_ms = gc_th->min_sleep_time;
+ 
+ 	set_freezable();
+ 	do {
+-		bool sync_mode;
++		bool sync_mode, foreground = false;
+ 
+ 		wait_event_interruptible_timeout(*wq,
+ 				kthread_should_stop() || freezing(current) ||
++				waitqueue_active(fggc_wq) ||
+ 				gc_th->gc_wake,
+ 				msecs_to_jiffies(wait_ms));
+ 
++		if (test_opt(sbi, GC_MERGE) && waitqueue_active(fggc_wq))
++			foreground = true;
++
+ 		/* give it a try one time */
+ 		if (gc_th->gc_wake)
+ 			gc_th->gc_wake = 0;
+@@ -49,12 +54,20 @@ static int gc_thread_func(void *data)
+ 			stat_other_skip_bggc_count(sbi);
+ 			continue;
+ 		}
++		if (f2fs_readonly(sbi->sb)) {
++			stat_other_skip_bggc_count(sbi);
++			if (foreground)
++				wake_up_all(fggc_wq);
++			continue;
++		}
+ 		if (kthread_should_stop())
+ 			break;
+ 
+ 		if (sbi->sb->s_writers.frozen >= SB_FREEZE_WRITE) {
+ 			increase_sleep_time(gc_th, &wait_ms);
+ 			stat_other_skip_bggc_count(sbi);
++			if (foreground)
++				wake_up_all(fggc_wq);
+ 			continue;
+ 		}
+ 
+@@ -65,9 +78,16 @@ static int gc_thread_func(void *data)
+ 
+ 		if (!sb_start_write_trylock(sbi->sb)) {
+ 			stat_other_skip_bggc_count(sbi);
++			if (foreground)
++				wake_up_all(fggc_wq);
+ 			continue;
+ 		}
+ 
++		if (!foreground &&
++		    F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF &&
++		    sbi->gc_mode != GC_URGENT)
++			goto next;
++
+ 		/*
+ 		 * [GC triggering condition]
+ 		 * 0. GC is not conducted currently.
+@@ -87,7 +107,10 @@ static int gc_thread_func(void *data)
+ 			goto do_gc;
+ 		}
+ 
+-		if (!f2fs_down_write_trylock(&sbi->gc_lock)) {
++		if (foreground) {
++			f2fs_down_write(&sbi->gc_lock);
++			goto do_gc;
++		} else if (!f2fs_down_write_trylock(&sbi->gc_lock)) {
+ 			stat_other_skip_bggc_count(sbi);
+ 			goto next;
+ 		}
+@@ -104,13 +127,28 @@ static int gc_thread_func(void *data)
+ 		else
+ 			increase_sleep_time(gc_th, &wait_ms);
+ do_gc:
+-		stat_inc_bggc_count(sbi->stat_info);
++		if (!foreground)
++			stat_inc_bggc_count(sbi->stat_info);
+ 
+ 		sync_mode = F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_SYNC;
+ 
++		/* foreground GC was triggered via f2fs_balance_fs() */
++		if (foreground)
++			sync_mode = false;
++
+ 		/* if return value is not zero, no victim was selected */
+-		if (f2fs_gc(sbi, sync_mode, true, NULL_SEGNO))
+-			wait_ms = gc_th->no_gc_sleep_time;
++		if (f2fs_gc(sbi, sync_mode, !foreground, NULL_SEGNO)) {
++			/* don't bother wait_ms by foreground gc */
++			if (!foreground)
++				wait_ms = gc_th->no_gc_sleep_time;
++		} else {
++			/* reset wait_ms to default sleep time */
++			if (wait_ms == gc_th->no_gc_sleep_time)
++				wait_ms = gc_th->min_sleep_time;
++		}
++
++		if (foreground)
++			wake_up_all(&gc_th->fggc_wq);
+ 
+ 		trace_f2fs_background_gc(sbi->sb, wait_ms,
+ 				prefree_segments(sbi), free_segments(sbi));
+@@ -126,44 +164,62 @@ static int gc_thread_func(void *data)
+ 
+ int f2fs_start_gc_thread(struct f2fs_sb_info *sbi)
+ {
+-	struct f2fs_gc_kthread *gc_th;
++	struct f2fs_gc_kthread *gc_th = READ_ONCE(sbi->gc_thread);
++	struct task_struct *task;
++	bool allocated = false;
+ 	dev_t dev = sbi->sb->s_bdev->bd_dev;
+-	int err = 0;
+ 
+-	gc_th = f2fs_kmalloc(sbi, sizeof(struct f2fs_gc_kthread), GFP_KERNEL);
++	if (gc_th && READ_ONCE(gc_th->f2fs_gc_task))
++		return 0;
++
+ 	if (!gc_th) {
+-		err = -ENOMEM;
+-		goto out;
++		gc_th = f2fs_kmalloc(sbi, sizeof(*gc_th), GFP_KERNEL);
++		if (!gc_th)
++			return -ENOMEM;
++		gc_th->f2fs_gc_task = NULL;
++		spin_lock_init(&gc_th->gc_task_lock);
++		init_waitqueue_head(&gc_th->gc_wait_queue_head);
++		init_waitqueue_head(&gc_th->fggc_wq);
++		allocated = true;
+ 	}
+ 
+ 	gc_th->urgent_sleep_time = DEF_GC_THREAD_URGENT_SLEEP_TIME;
+ 	gc_th->min_sleep_time = DEF_GC_THREAD_MIN_SLEEP_TIME;
+ 	gc_th->max_sleep_time = DEF_GC_THREAD_MAX_SLEEP_TIME;
+ 	gc_th->no_gc_sleep_time = DEF_GC_THREAD_NOGC_SLEEP_TIME;
++	gc_th->gc_wake = 0;
+ 
+-	gc_th->gc_wake= 0;
++	task = kthread_create(gc_thread_func, sbi, "f2fs_gc-%u:%u",
++			      MAJOR(dev), MINOR(dev));
++	if (IS_ERR(task)) {
++		int err = PTR_ERR(task);
+ 
+-	sbi->gc_thread = gc_th;
+-	init_waitqueue_head(&sbi->gc_thread->gc_wait_queue_head);
+-	sbi->gc_thread->f2fs_gc_task = kthread_run(gc_thread_func, sbi,
+-			"f2fs_gc-%u:%u", MAJOR(dev), MINOR(dev));
+-	if (IS_ERR(gc_th->f2fs_gc_task)) {
+-		err = PTR_ERR(gc_th->f2fs_gc_task);
+-		kvfree(gc_th);
+-		sbi->gc_thread = NULL;
++		if (allocated)
++			kvfree(gc_th);
++		return err;
+ 	}
+-out:
+-	return err;
++
++	if (allocated)
++		WRITE_ONCE(sbi->gc_thread, gc_th);
++	f2fs_set_gc_task(gc_th, task);
++	wake_up_process(task);
++	return 0;
+ }
+ 
+ void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi)
+ {
+-	struct f2fs_gc_kthread *gc_th = sbi->gc_thread;
++	struct f2fs_gc_kthread *gc_th = READ_ONCE(sbi->gc_thread);
++	struct task_struct *task;
++
+ 	if (!gc_th)
+ 		return;
+-	kthread_stop(gc_th->f2fs_gc_task);
+-	kvfree(gc_th);
+-	sbi->gc_thread = NULL;
++
++	task = f2fs_detach_gc_task(gc_th);
++	if (!task)
++		return;
++
++	kthread_stop(task);
++	wake_up_all(&gc_th->fggc_wq);
+ }
+ 
+ static int select_gc_type(struct f2fs_sb_info *sbi, int gc_type)
+diff --git a/fs/f2fs/gc.h b/fs/f2fs/gc.h
+index dd9707b..ebf2f1c 100644
+--- a/fs/f2fs/gc.h
++++ b/fs/f2fs/gc.h
+@@ -5,6 +5,9 @@
+  * Copyright (c) 2012 Samsung Electronics Co., Ltd.
+  *             http://www.samsung.com/
+  */
++#include <linux/sched/task.h>
++#include <linux/spinlock.h>
++
+ #define GC_THREAD_MIN_WB_PAGES		1	/*
+ 						 * a threshold to determine
+ 						 * whether IO subsystem is idle
+@@ -32,6 +35,7 @@
+ 
+ struct f2fs_gc_kthread {
+ 	struct task_struct *f2fs_gc_task;
++	spinlock_t gc_task_lock;		/* protects f2fs_gc_task */
+ 	wait_queue_head_t gc_wait_queue_head;
+ 
+ 	/* for gc sleep time */
+@@ -42,8 +46,35 @@ struct f2fs_gc_kthread {
+ 
+ 	/* for changing gc mode */
+ 	unsigned int gc_wake;
++
++	/* for GC_MERGE mount option */
++	wait_queue_head_t fggc_wq;		/*
++						 * caller of f2fs_balance_fs()
++						 * will wait on this wait queue.
++						 */
+ };
+ 
++static inline void f2fs_set_gc_task(struct f2fs_gc_kthread *gc_th,
++				    struct task_struct *task)
++{
++	spin_lock(&gc_th->gc_task_lock);
++	WRITE_ONCE(gc_th->f2fs_gc_task, task);
++	spin_unlock(&gc_th->gc_task_lock);
++}
++
++static inline struct task_struct *
++f2fs_detach_gc_task(struct f2fs_gc_kthread *gc_th)
++{
++	struct task_struct *task;
++
++	spin_lock(&gc_th->gc_task_lock);
++	task = READ_ONCE(gc_th->f2fs_gc_task);
++	WRITE_ONCE(gc_th->f2fs_gc_task, NULL);
++	spin_unlock(&gc_th->gc_task_lock);
++
++	return task;
++}
++
+ struct gc_inode_list {
+ 	struct list_head ilist;
+ 	struct radix_tree_root iroot;
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+index e97fddc..9753412 100644
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -502,6 +502,8 @@ int f2fs_commit_inmem_pages(struct inode *inode)
+  */
+ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
+ {
++	struct f2fs_gc_kthread *gc_th;
++
+ 	if (f2fs_cp_error(sbi))
+ 		return;
+ 
+@@ -522,8 +524,26 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
+ 	 * dir/node pages without enough free segments.
+ 	 */
+ 	if (has_not_enough_free_secs(sbi, 0, 0)) {
+-		f2fs_down_write(&sbi->gc_lock);
+-		f2fs_gc(sbi, false, false, NULL_SEGNO);
++		f2fs_submit_merged_write(sbi, DATA);
++		f2fs_submit_all_merged_ipu_writes(sbi);
++
++		gc_th = READ_ONCE(sbi->gc_thread);
++		if (test_opt(sbi, GC_MERGE) && gc_th &&
++		    READ_ONCE(gc_th->f2fs_gc_task)) {
++			DEFINE_WAIT(wait);
++
++			prepare_to_wait(&gc_th->fggc_wq, &wait,
++					TASK_UNINTERRUPTIBLE);
++			if (!f2fs_cp_error(sbi) &&
++			    READ_ONCE(gc_th->f2fs_gc_task)) {
++				wake_up(&gc_th->gc_wait_queue_head);
++				io_schedule();
++			}
++			finish_wait(&gc_th->fggc_wq, &wait);
++		} else {
++			f2fs_down_write(&sbi->gc_lock);
++			f2fs_gc(sbi, false, false, NULL_SEGNO);
++		}
+ 	}
+ }
+ 
+diff --git a/fs/f2fs/super.c b/fs/f2fs/super.c
+index 624a14e..603b559 100644
+--- a/fs/f2fs/super.c
++++ b/fs/f2fs/super.c
+@@ -157,6 +157,8 @@ enum {
+ 	Opt_compress_log_size,
+ 	Opt_compress_extension,
+ 	Opt_atgc,
++	Opt_gc_merge,
++	Opt_nogc_merge,
+ 	Opt_err,
+ };
+ 
+@@ -227,6 +229,8 @@ static match_table_t f2fs_tokens = {
+ 	{Opt_compress_log_size, "compress_log_size=%u"},
+ 	{Opt_compress_extension, "compress_extension=%s"},
+ 	{Opt_atgc, "atgc"},
++	{Opt_gc_merge, "gc_merge"},
++	{Opt_nogc_merge, "nogc_merge"},
+ 	{Opt_err, NULL},
+ };
+ 
+@@ -1052,6 +1056,12 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
+ 		case Opt_atgc:
+ 			set_opt(sbi, ATGC);
+ 			break;
++		case Opt_gc_merge:
++			set_opt(sbi, GC_MERGE);
++			break;
++		case Opt_nogc_merge:
++			clear_opt(sbi, GC_MERGE);
++			break;
+ 		default:
+ 			f2fs_err(sbi, "Unrecognized mount option \"%s\" or missing value",
+ 				 p);
+@@ -1327,6 +1337,7 @@ static void f2fs_put_super(struct super_block *sb)
+ 
+ 	/* unregister procfs/sysfs entries in advance to avoid race case */
+ 	f2fs_unregister_sysfs(sbi);
++	f2fs_stop_gc_thread(sbi);
+ 
+ 	f2fs_quota_off_umount(sb);
+ 
+@@ -1417,6 +1428,8 @@ static void f2fs_put_super(struct super_block *sb)
+ #ifdef CONFIG_UNICODE
+ 	utf8_unload(sb->s_encoding);
+ #endif
++	kvfree(sbi->gc_thread);
++	sbi->gc_thread = NULL;
+ 	kvfree(sbi);
+ }
+ 
+@@ -1653,6 +1666,11 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
+ 	else if (F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF)
+ 		seq_printf(seq, ",background_gc=%s", "off");
+ 
++	if (test_opt(sbi, GC_MERGE))
++		seq_puts(seq, ",gc_merge");
++	else
++		seq_puts(seq, ",nogc_merge");
++
+ 	if (test_opt(sbi, DISABLE_ROLL_FORWARD))
+ 		seq_puts(seq, ",disable_roll_forward");
+ 	if (test_opt(sbi, NORECOVERY))
+@@ -2073,12 +2091,15 @@ static int f2fs_remount(struct vfsmount *mnt, struct super_block *sb,
+ 	 * option. Also sync the filesystem.
+ 	 */
+ 	if ((*flags & MS_RDONLY) ||
+-			F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF) {
+-		if (sbi->gc_thread) {
++			(F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF &&
++			!test_opt(sbi, GC_MERGE))) {
++		if (sbi->gc_thread &&
++		    READ_ONCE(sbi->gc_thread->f2fs_gc_task)) {
+ 			f2fs_stop_gc_thread(sbi);
+ 			need_restart_gc = true;
+ 		}
+-	} else if (!sbi->gc_thread) {
++	} else if (!sbi->gc_thread ||
++			!READ_ONCE(sbi->gc_thread->f2fs_gc_task)) {
+ 		err = f2fs_start_gc_thread(sbi);
+ 		if (err)
+ 			goto restore_opts;
+@@ -4038,7 +4059,8 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
+ 	 * If filesystem is not mounted as read-only then
+ 	 * do start the gc_thread.
+ 	 */
+-	if (F2FS_OPTION(sbi).bggc_mode != BGGC_MODE_OFF && !f2fs_readonly(sb)) {
++	if ((F2FS_OPTION(sbi).bggc_mode != BGGC_MODE_OFF ||
++	     test_opt(sbi, GC_MERGE)) && !f2fs_readonly(sb)) {
+ 		/* After POR, we can run background GC thread.*/
+ 		err = f2fs_start_gc_thread(sbi);
+ 		if (err)
+@@ -4073,6 +4095,7 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
+ 	retry_cnt = 0;
+ 
+ free_meta:
++	f2fs_stop_gc_thread(sbi);
+ #ifdef CONFIG_QUOTA
+ 	f2fs_truncate_quota_inode_pages(sb);
+ 	if (f2fs_sb_has_quota_ino(sbi) && !f2fs_readonly(sb))
+@@ -4134,6 +4157,9 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
+ free_sb_buf:
+ 	kvfree(raw_super);
+ free_sbi:
++	f2fs_stop_gc_thread(sbi);
++	kvfree(sbi->gc_thread);
++	sbi->gc_thread = NULL;
+ 	if (sbi->s_chksum_driver)
+ 		crypto_free_shash(sbi->s_chksum_driver);
+ 	kvfree(sbi);

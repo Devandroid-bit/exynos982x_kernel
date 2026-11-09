@@ -1,0 +1,208 @@
+name: Apply f2fs gc_merge backport
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to update (must match the fixed target below)"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: f2fs-gc-merge-backports-ack-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: devandroid-droidspaces-mglru-backports-ack
+  BASE_SHA: 43a08e0550d17dfcacd80b6350580e59d748ce03
+  PATCH_PATH: .github/workflows/f2fs-gc-merge-backports-ack.patch
+  WORKFLOW_PATH: .github/workflows/apply-f2fs-gc-merge-backports-ack.yml
+  PATCH_SHA256: 91eb680707672d167ec4208190e11a5e8604c2f48c78a6bf3734381cc8788f00
+  SOURCE_TREE: 8de5b19a6d42369ca71657e55fe4c58ab080c33d
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout dispatched target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate target, patch, and base
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$TARGET_BRANCH" = "devandroid-droidspaces-mglru-backports-ack"
+          test "$GITHUB_REF" = "refs/heads/${TARGET_BRANCH}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$PATCH_PATH"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test "$(grep -c '^From [0-9a-f]\{40\} ' "$PATCH_PATH")" -eq 1
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test -z "$(git status --porcelain)"
+
+      - name: Detect target state
+        run: |
+          set -euo pipefail
+          START_SHA=$(git rev-parse HEAD)
+          BASE_FILES="$RUNNER_TEMP/expected-control-files"
+          ACTUAL_BASE_FILES="$RUNNER_TEMP/actual-control-files"
+
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" | LC_ALL=C sort > "$BASE_FILES"
+
+          git diff --name-only "$BASE_SHA" "$START_SHA" | LC_ALL=C sort > "$ACTUAL_BASE_FILES"
+
+          if cmp -s "$BASE_FILES" "$ACTUAL_BASE_FILES" &&
+             git diff --quiet "$BASE_SHA" "$START_SHA" -- . ':(exclude).github/workflows'; then
+            STATE=apply
+            VERIFY_BASE=$START_SHA
+          else
+            VERIFY_BASE=$(git rev-parse "${START_SHA}~1")
+            test "$(git rev-list --count "$VERIFY_BASE..$START_SHA")" -eq 1
+            git cat-file -e "${VERIFY_BASE}:${WORKFLOW_PATH}"
+            git cat-file -e "${VERIFY_BASE}:${PATCH_PATH}"
+            STATE=already-applied
+          fi
+
+          echo "START_SHA=$START_SHA" >> "$GITHUB_ENV"
+          echo "VERIFY_BASE=$VERIFY_BASE" >> "$GITHUB_ENV"
+          echo "STATE=$STATE" >> "$GITHUB_ENV"
+          echo "Detected state: $STATE"
+          echo "Start commit: $START_SHA"
+          echo "Backport base: $VERIFY_BASE"
+
+      - name: Apply patch in place
+        if: env.STATE == 'apply'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git am --keep-cr "$PATCH_PATH"; then
+            git am --abort || true
+            exit 1
+          fi
+
+      - name: Verify one backport
+        run: |
+          set -euo pipefail
+          test -n "$VERIFY_BASE"
+          test "$(git rev-list --count "$VERIFY_BASE..HEAD")" -eq 1
+          test "$(git rev-list --merges --count "$VERIFY_BASE..HEAD")" -eq 0
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git diff --check "$VERIFY_BASE" HEAD
+          git diff --quiet "$START_SHA" HEAD -- .github/workflows
+
+          SOURCE_FILES="$RUNNER_TEMP/expected-source-files"
+          ACTUAL_SOURCE_FILES="$RUNNER_TEMP/actual-source-files"
+          printf '%s\n' \
+            "Documentation/filesystems/f2fs.txt" \
+            "fs/f2fs/data.c" \
+            "fs/f2fs/f2fs.h" \
+            "fs/f2fs/gc.c" \
+            "fs/f2fs/gc.h" \
+            "fs/f2fs/segment.c" \
+            "fs/f2fs/super.c" | LC_ALL=C sort > "$SOURCE_FILES"
+          git diff --name-only "$VERIFY_BASE" HEAD | LC_ALL=C sort > "$ACTUAL_SOURCE_FILES"
+          diff -u "$SOURCE_FILES" "$ACTUAL_SOURCE_FILES"
+
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-verify"
+          rm -f "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree HEAD
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q "$WORKFLOW_PATH" "$PATCH_PATH"
+          test "$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree)" = "$SOURCE_TREE"
+          rm -f "$SOURCE_INDEX"
+
+          FINAL_FILES="$RUNNER_TEMP/expected-final-files"
+          ACTUAL_FINAL_FILES="$RUNNER_TEMP/actual-final-files"
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" \
+            "Documentation/filesystems/f2fs.txt" \
+            "fs/f2fs/data.c" \
+            "fs/f2fs/f2fs.h" \
+            "fs/f2fs/gc.c" \
+            "fs/f2fs/gc.h" \
+            "fs/f2fs/segment.c" \
+            "fs/f2fs/super.c" | LC_ALL=C sort > "$FINAL_FILES"
+          git diff --name-only "$BASE_SHA" HEAD | LC_ALL=C sort > "$ACTUAL_FINAL_FILES"
+          diff -u "$FINAL_FILES" "$ACTUAL_FINAL_FILES"
+
+          cat > "$RUNNER_TEMP/expected-subjects" <<'EOF'
+          BACKPORT: f2fs: introduce gc_merge mount option
+          EOF
+          git log --reverse --format='%s' "$VERIFY_BASE..HEAD" > "$RUNNER_TEMP/actual-subjects"
+          diff -u "$RUNNER_TEMP/expected-subjects" "$RUNNER_TEMP/actual-subjects"
+
+          cat > "$RUNNER_TEMP/expected-authors" <<'EOF'
+          Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+          EOF
+          git log --reverse --format='%an <%ae>' "$VERIFY_BASE..HEAD" > "$RUNNER_TEMP/actual-authors"
+          diff -u "$RUNNER_TEMP/expected-authors" "$RUNNER_TEMP/actual-authors"
+
+          git log "$VERIFY_BASE..HEAD" --format=%B > "$RUNNER_TEMP/commit-bodies"
+          test "$(grep -Fxc 'Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>' "$RUNNER_TEMP/commit-bodies")" -eq 1
+          test "$(grep -Fxc 'Original-author: Chao Yu <yuchao0@huawei.com>' "$RUNNER_TEMP/commit-bodies")" -eq 1
+          test "$(grep -Fxc 'Upstream commit: 5911d2d1d1a38b26585383478bd71d9254e48bdf' "$RUNNER_TEMP/commit-bodies")" -eq 1
+          test "$(grep -Fxc 'Author: @Devandroid-bit.' "$RUNNER_TEMP/commit-bodies")" -eq 1
+          grep -Fq 'Samsung Exynos 2400' "$RUNNER_TEMP/commit-bodies"
+          grep -Fq 'android14-6.1-S921BXXSDCZB2' "$RUNNER_TEMP/commit-bodies"
+
+          git log --oneline "$VERIFY_BASE..HEAD"
+
+      - name: Push target branch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          REMOTE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-remote"
+          rm -f "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree "$REMOTE_SHA"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q --ignore-unmatch "$WORKFLOW_PATH" "$PATCH_PATH"
+          REMOTE_SOURCE_TREE=$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree)
+          rm -f "$SOURCE_INDEX"
+
+          if [ "$REMOTE_SHA" = "$HEAD_SHA" ]; then
+            RESULT_SHA=$REMOTE_SHA
+            echo "Target branch already has the expected commit; nothing to push."
+          elif [ "$REMOTE_SHA" = "$START_SHA" ]; then
+            git merge-base --is-ancestor "$REMOTE_SHA" "$HEAD_SHA"
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+            test "$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")" = "$HEAD_SHA"
+            RESULT_SHA=$HEAD_SHA
+          elif git merge-base --is-ancestor "$START_SHA" "$REMOTE_SHA" &&
+               test "$(git rev-list --count "$START_SHA..$REMOTE_SHA")" -eq 1 &&
+               test "$REMOTE_SOURCE_TREE" = "$SOURCE_TREE" &&
+               git diff --quiet "$START_SHA" "$REMOTE_SHA" -- .github/workflows; then
+            RESULT_SHA=$REMOTE_SHA
+            echo "Target branch already has the expected backport; nothing to push."
+          else
+            echo "::error::Target branch changed during workflow; expected $START_SHA or $HEAD_SHA, found $REMOTE_SHA."
+            exit 1
+          fi
+
+          echo "### f2fs gc_merge backport applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- State: \`${STATE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Start commit: \`${START_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Result commit: \`${RESULT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Patch SHA256: \`${PATCH_SHA256}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits:" >> "$GITHUB_STEP_SUMMARY"
+          git log --format='- `%h` %s' "$VERIFY_BASE..$RESULT_SHA" >> "$GITHUB_STEP_SUMMARY"
