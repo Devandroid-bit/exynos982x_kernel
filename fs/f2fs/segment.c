@@ -502,6 +502,8 @@ int f2fs_commit_inmem_pages(struct inode *inode)
  */
 void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 {
+	struct f2fs_gc_kthread *gc_th;
+
 	if (f2fs_cp_error(sbi))
 		return;
 
@@ -522,8 +524,26 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 	 * dir/node pages without enough free segments.
 	 */
 	if (has_not_enough_free_secs(sbi, 0, 0)) {
-		f2fs_down_write(&sbi->gc_lock);
-		f2fs_gc(sbi, false, false, NULL_SEGNO);
+		f2fs_submit_merged_write(sbi, DATA);
+		f2fs_submit_all_merged_ipu_writes(sbi);
+
+		gc_th = READ_ONCE(sbi->gc_thread);
+		if (test_opt(sbi, GC_MERGE) && gc_th &&
+		    READ_ONCE(gc_th->f2fs_gc_task)) {
+			DEFINE_WAIT(wait);
+
+			prepare_to_wait(&gc_th->fggc_wq, &wait,
+					TASK_UNINTERRUPTIBLE);
+			if (!f2fs_cp_error(sbi) &&
+			    READ_ONCE(gc_th->f2fs_gc_task)) {
+				wake_up(&gc_th->gc_wait_queue_head);
+				io_schedule();
+			}
+			finish_wait(&gc_th->fggc_wq, &wait);
+		} else {
+			f2fs_down_write(&sbi->gc_lock);
+			f2fs_gc(sbi, false, false, NULL_SEGNO);
+		}
 	}
 }
 

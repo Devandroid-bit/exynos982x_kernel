@@ -157,6 +157,8 @@ enum {
 	Opt_compress_log_size,
 	Opt_compress_extension,
 	Opt_atgc,
+	Opt_gc_merge,
+	Opt_nogc_merge,
 	Opt_err,
 };
 
@@ -227,6 +229,8 @@ static match_table_t f2fs_tokens = {
 	{Opt_compress_log_size, "compress_log_size=%u"},
 	{Opt_compress_extension, "compress_extension=%s"},
 	{Opt_atgc, "atgc"},
+	{Opt_gc_merge, "gc_merge"},
+	{Opt_nogc_merge, "nogc_merge"},
 	{Opt_err, NULL},
 };
 
@@ -1052,6 +1056,12 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 		case Opt_atgc:
 			set_opt(sbi, ATGC);
 			break;
+		case Opt_gc_merge:
+			set_opt(sbi, GC_MERGE);
+			break;
+		case Opt_nogc_merge:
+			clear_opt(sbi, GC_MERGE);
+			break;
 		default:
 			f2fs_err(sbi, "Unrecognized mount option \"%s\" or missing value",
 				 p);
@@ -1327,6 +1337,7 @@ static void f2fs_put_super(struct super_block *sb)
 
 	/* unregister procfs/sysfs entries in advance to avoid race case */
 	f2fs_unregister_sysfs(sbi);
+	f2fs_stop_gc_thread(sbi);
 
 	f2fs_quota_off_umount(sb);
 
@@ -1417,6 +1428,8 @@ static void f2fs_put_super(struct super_block *sb)
 #ifdef CONFIG_UNICODE
 	utf8_unload(sb->s_encoding);
 #endif
+	kvfree(sbi->gc_thread);
+	sbi->gc_thread = NULL;
 	kvfree(sbi);
 }
 
@@ -1652,6 +1665,11 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 		seq_printf(seq, ",background_gc=%s", "on");
 	else if (F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF)
 		seq_printf(seq, ",background_gc=%s", "off");
+
+	if (test_opt(sbi, GC_MERGE))
+		seq_puts(seq, ",gc_merge");
+	else
+		seq_puts(seq, ",nogc_merge");
 
 	if (test_opt(sbi, DISABLE_ROLL_FORWARD))
 		seq_puts(seq, ",disable_roll_forward");
@@ -2073,12 +2091,15 @@ static int f2fs_remount(struct vfsmount *mnt, struct super_block *sb,
 	 * option. Also sync the filesystem.
 	 */
 	if ((*flags & MS_RDONLY) ||
-			F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF) {
-		if (sbi->gc_thread) {
+			(F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF &&
+			!test_opt(sbi, GC_MERGE))) {
+		if (sbi->gc_thread &&
+		    READ_ONCE(sbi->gc_thread->f2fs_gc_task)) {
 			f2fs_stop_gc_thread(sbi);
 			need_restart_gc = true;
 		}
-	} else if (!sbi->gc_thread) {
+	} else if (!sbi->gc_thread ||
+			!READ_ONCE(sbi->gc_thread->f2fs_gc_task)) {
 		err = f2fs_start_gc_thread(sbi);
 		if (err)
 			goto restore_opts;
@@ -4038,7 +4059,8 @@ reset_checkpoint:
 	 * If filesystem is not mounted as read-only then
 	 * do start the gc_thread.
 	 */
-	if (F2FS_OPTION(sbi).bggc_mode != BGGC_MODE_OFF && !f2fs_readonly(sb)) {
+	if ((F2FS_OPTION(sbi).bggc_mode != BGGC_MODE_OFF ||
+	     test_opt(sbi, GC_MERGE)) && !f2fs_readonly(sb)) {
 		/* After POR, we can run background GC thread.*/
 		err = f2fs_start_gc_thread(sbi);
 		if (err)
@@ -4073,6 +4095,7 @@ sync_free_meta:
 	retry_cnt = 0;
 
 free_meta:
+	f2fs_stop_gc_thread(sbi);
 #ifdef CONFIG_QUOTA
 	f2fs_truncate_quota_inode_pages(sb);
 	if (f2fs_sb_has_quota_ino(sbi) && !f2fs_readonly(sb))
@@ -4134,6 +4157,9 @@ free_options:
 free_sb_buf:
 	kvfree(raw_super);
 free_sbi:
+	f2fs_stop_gc_thread(sbi);
+	kvfree(sbi->gc_thread);
+	sbi->gc_thread = NULL;
 	if (sbi->s_chksum_driver)
 		crypto_free_shash(sbi->s_chksum_driver);
 	kvfree(sbi);
