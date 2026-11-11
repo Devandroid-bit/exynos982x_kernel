@@ -1,0 +1,159 @@
+name: Apply Android 17 compat backports
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to update (must match the fixed target below)"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android17-compat-backports-ack-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: devandroid-droidspaces-mglru-backports-ack
+  PATCH_PATH: .github/workflows/android17-compat-backports-ack.patch
+  WORKFLOW_PATH: .github/workflows/apply-android17-compat-backports-ack.yml
+  PATCH_SHA256: 1db975be38f99b95ae6ea1bda094a7378c59d6617e9ca008190ffe77e4c620e9
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout dispatched target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate target and patch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$TARGET_BRANCH" = "devandroid-droidspaces-mglru-backports-ack"
+          test "$GITHUB_REF" = "refs/heads/${TARGET_BRANCH}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$PATCH_PATH"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test -z "$(git status --porcelain)"
+
+      - name: Detect state and apply
+        run: |
+          set -euo pipefail
+          START_SHA=$(git rev-parse HEAD)
+
+          if git apply --check "$PATCH_PATH" >/dev/null 2>&1; then
+            STATE=apply
+          else
+            STATE=already-applied
+          fi
+
+          if [ "$STATE" = "apply" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git am --keep-cr "$PATCH_PATH"
+            BASE_SHA=$START_SHA
+          else
+            BASE_SHA=$(git rev-parse "${START_SHA}~2")
+          fi
+
+          echo "START_SHA=$START_SHA" >> "$GITHUB_ENV"
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "STATE=$STATE" >> "$GITHUB_ENV"
+          echo "Detected state: $STATE"
+          echo "Start commit: $START_SHA"
+          echo "Backport base: $BASE_SHA"
+
+      - name: Verify backports
+        run: |
+          set -euo pipefail
+          test "$(git rev-list --count "$BASE_SHA..HEAD")" -eq 2
+          test "$(git rev-list --merges --count "$BASE_SHA..HEAD")" -eq 0
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git diff --quiet "$START_SHA" HEAD -- .github/workflows
+          git diff --check "$BASE_SHA" HEAD -- . ':(exclude)arch/arm64/configs'
+
+          FILES="$RUNNER_TEMP/expected-files"
+          ACTUAL_FILES="$RUNNER_TEMP/actual-files"
+          cat > "$FILES" <<'EOF'
+          Documentation/sysctl/kernel.txt
+          arch/arm64/configs/d1.config
+          arch/arm64/configs/d1xks.config
+          arch/arm64/configs/d2s.config
+          arch/arm64/configs/d2x.config
+          arch/arm64/configs/d2xks.config
+          fs/read_write.c
+          fs/stat.c
+          include/linux/perf_event.h
+          kernel/events/core.c
+          security/Kconfig
+          EOF
+          LC_ALL=C sort "$FILES" -o "$FILES"
+          git diff --name-only "$BASE_SHA" HEAD | LC_ALL=C sort > "$ACTUAL_FILES"
+          diff -u "$FILES" "$ACTUAL_FILES"
+
+          SUBJECTS="$RUNNER_TEMP/expected-subjects"
+          ACTUAL_SUBJECTS="$RUNNER_TEMP/actual-subjects"
+          cat > "$SUBJECTS" <<'EOF'
+          fs: hook the fstat size for the Android 17 init rc injection
+          BACKPORT: ANDROID: security,perf: Allow further restriction of perf_event_open
+          EOF
+          git log --reverse --format='%s' "$BASE_SHA..HEAD" > "$ACTUAL_SUBJECTS"
+          diff -u "$SUBJECTS" "$ACTUAL_SUBJECTS"
+
+          AUTHORS="$RUNNER_TEMP/expected-authors"
+          ACTUAL_AUTHORS="$RUNNER_TEMP/actual-authors"
+          cat > "$AUTHORS" <<'EOF'
+          Star-Seven <72426083+Star-Seven@users.noreply.github.com>
+          Jeff Vander Stoep <jeffv@google.com>
+          EOF
+          git log --reverse --format='%an <%ae>' "$BASE_SHA..HEAD" > "$ACTUAL_AUTHORS"
+          diff -u "$AUTHORS" "$ACTUAL_AUTHORS"
+
+          SECOND=$(git rev-list --reverse "$BASE_SHA..HEAD" | tail -1)
+          git log -1 --format=%B "$SECOND" > "$RUNNER_TEMP/second-body"
+          grep -Fq 'for d1, d1xks, d2s, d2x,' "$RUNNER_TEMP/second-body"
+          grep -Fq 'and d2xks, which is what Android 17 expects.' "$RUNNER_TEMP/second-body"
+          ! grep -Fq 'for d2s and d2xks' "$RUNNER_TEMP/second-body"
+
+          for device in d1 d1xks d2s d2x d2xks; do
+            grep -q '^CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y' \
+              "arch/arm64/configs/${device}.config"
+          done
+          grep -q 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -q 'ksu_handle_fstat64_ret' fs/stat.c
+          grep -q 'void ksu_handle_sys_read(unsigned int fd)' fs/read_write.c
+
+          git log --oneline "$BASE_SHA..HEAD"
+
+      - name: Push target branch
+        if: env.STATE == 'apply'
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          REMOTE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$REMOTE_SHA" = "$START_SHA"
+          git merge-base --is-ancestor "$START_SHA" "$HEAD_SHA"
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          test "$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")" = "$HEAD_SHA"
+
+          echo "### Android 17 compat backports applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- State: \`${STATE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Start commit: \`${START_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Result commit: \`${HEAD_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Patch SHA256: \`${PATCH_SHA256}\`" >> "$GITHUB_STEP_SUMMARY"

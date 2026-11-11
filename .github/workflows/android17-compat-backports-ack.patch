@@ -1,0 +1,252 @@
+From 177ea4572b7724f3811d0597a10e66568ef4c4b6 Mon Sep 17 00:00:00 2001
+From: Star-Seven <72426083+Star-Seven@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:36:48 +0000
+Subject: [PATCH] fs: hook the fstat size for the Android 17 init rc injection
+
+Android 17's init reads init.rc with libbase ReadFdToString, which copies
+exactly fstat().st_size bytes and never reads to EOF. KernelSU-Next appends
+its rc block after EOF, so on A17 the appended "exec ksud post-fs-data" is
+never seen, ksud never runs and modules are never mounted.
+
+Wire ksu_handle_newfstat_ret and ksu_handle_fstat64_ret so the hook can grow
+the reported st_size by the injected length. Also fix the read hook signature
+to the one this KernelSU-Next branch defines (void ksu_handle_sys_read(unsigned
+int)); the previous three-argument declaration never matched it.
+
+Signed-off-by: Star-Seven <72426083+Star-Seven@users.noreply.github.com>
+---
+diff --git a/fs/read_write.c b/fs/read_write.c
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -600,8 +600,7 @@
+ 
+ #ifdef CONFIG_KSU
+ extern bool ksu_vfs_read_hook __read_mostly;
+-extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,
+-				char __user **buf_ptr, size_t *count_ptr);
++extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);
+ #endif
+ SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+ {
+@@ -609,7 +608,7 @@
+ 	ssize_t ret = -EBADF;
+ #ifdef CONFIG_KSU
+ 	if (unlikely(ksu_vfs_read_hook)) 
+-		ksu_handle_sys_read(fd, &buf, &count);
++		ksu_handle_sys_read(fd);
+ #endif
+ 
+ 	if (f.file) {
+diff --git a/fs/stat.c b/fs/stat.c
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -357,6 +357,12 @@
+ __attribute__((hot)) 
+ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+ 				int *flags);
++extern void ksu_handle_newfstat_ret(unsigned int *fd,
++				struct stat __user **statbuf_ptr);
++#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
++extern void ksu_handle_fstat64_ret(unsigned long *fd,
++				struct stat64 __user **statbuf_ptr);
++#endif
+ #endif
+ 
+ #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+@@ -384,6 +390,11 @@
+ 
+ 	if (!error)
+ 		error = cp_new_stat(&stat, statbuf);
++
++#if defined CONFIG_KSU
++	if (!error)
++		ksu_handle_newfstat_ret(&fd, &statbuf);
++#endif
+ 
+ 	return error;
+ }
+@@ -504,6 +515,11 @@
+ 
+ 	if (!error)
+ 		error = cp_new_stat64(&stat, statbuf);
++
++#if defined CONFIG_KSU
++	if (!error)
++		ksu_handle_fstat64_ret(&fd, &statbuf);
++#endif
+ 
+ 	return error;
+ }
+From 6cb7db6b4a1bfdfeea7c1fef1a4ace05b345eb58 Mon Sep 17 00:00:00 2001
+From: Jeff Vander Stoep <jeffv@google.com>
+Date: Sun, 29 May 2016 14:22:32 -0700
+Subject: [PATCH] BACKPORT: ANDROID: security,perf: Allow further restriction
+ of perf_event_open
+
+commit 5dbd8df7b35643210226329bd7e60658c07a036f upstream.
+
+When kernel.perf_event_open is set to 3 (or greater), disallow all
+access to performance events by users without CAP_SYS_ADMIN.
+Add a Kconfig symbol CONFIG_SECURITY_PERF_EVENTS_RESTRICT that
+makes this value the default.
+
+This is based on a similar feature in grsecurity
+(CONFIG_GRKERNSEC_PERF_HARDEN).  This version doesn't include making
+the variable read-only.  It also allows enabling further restriction
+at run-time regardless of whether the default is changed.
+
+https://lkml.org/lkml/2016/1/11/587
+
+Bug: 29054680
+Bug: 120445712
+Change-Id: Iff5bff4fc1042e85866df9faa01bce8d04335ab8
+[jeffv: Upstream doesn't want it https://lkml.org/lkml/2016/6/17/101]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+Enable CONFIG_SECURITY_PERF_EVENTS_RESTRICT for d1, d1xks, d2s, d2x,
+and d2xks, which is what Android 17 expects.
+
+Signed-off-by: Star-Seven <72426083+Star-Seven@users.noreply.github.com>
+---
+diff --git a/Documentation/sysctl/kernel.txt b/Documentation/sysctl/kernel.txt
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@ -665,7 +665,8 @@
+ perf_event_paranoid:
+ 
+ Controls use of the performance events system by unprivileged
+-users (without CAP_SYS_ADMIN).  The default value is 2.
++users (without CAP_SYS_ADMIN).  The default value is 3 if
++CONFIG_SECURITY_PERF_EVENTS_RESTRICT is set, or 2 otherwise.
+ 
+  -1: Allow use of (almost) all events by all users
+      Ignore mlock limit after perf_event_mlock_kb without CAP_IPC_LOCK
+@@ -673,6 +674,7 @@
+      Disallow raw tracepoint access by users without CAP_SYS_ADMIN
+ >=1: Disallow CPU event access by users without CAP_SYS_ADMIN
+ >=2: Disallow kernel profiling by users without CAP_SYS_ADMIN
++>=3: Disallow all event access by users without CAP_SYS_ADMIN
+ 
+ ==============================================================
+ 
+diff --git a/arch/arm64/configs/d1.config b/arch/arm64/configs/d1.config
+--- a/arch/arm64/configs/d1.config
++++ b/arch/arm64/configs/d1.config
+@@ -1,5 +1,8 @@
+ # Config file for d2s
+ # This is merged with exynos9820_defconfig on build
++
++# Security
++CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y
+ 
+ # TZDEV
+ CONFIG_TZDEV_DEPLOY_OLD_TZAR=y
+diff --git a/arch/arm64/configs/d1xks.config b/arch/arm64/configs/d1xks.config
+--- a/arch/arm64/configs/d1xks.config
++++ b/arch/arm64/configs/d1xks.config
+@@ -1,5 +1,8 @@
+ # Config file for d2s
+ # This is merged with exynos9820_defconfig on build
++
++# Security
++CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y
+ 
+ # TZDEV
+ # CONFIG_TZDEV_DEPLOY_OLD_TZAR is not set
+diff --git a/arch/arm64/configs/d2s.config b/arch/arm64/configs/d2s.config
+--- a/arch/arm64/configs/d2s.config
++++ b/arch/arm64/configs/d2s.config
+@@ -1,5 +1,8 @@
+ # Config file for d2s
+ # This is merged with exynos9820_defconfig on build
++
++# Security
++CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y
+ 
+ # TZDEV
+ CONFIG_TZDEV_DEPLOY_OLD_TZAR=y
+diff --git a/arch/arm64/configs/d2x.config b/arch/arm64/configs/d2x.config
+--- a/arch/arm64/configs/d2x.config
++++ b/arch/arm64/configs/d2x.config
+@@ -1,5 +1,8 @@
+ # Config file for d2x
+ # This is merged with exynos9820_defconfig on build
++
++# Security
++CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y
+ 
+ # TZDEV
+ CONFIG_TZDEV_DEPLOY_OLD_TZAR=y
+diff --git a/arch/arm64/configs/d2xks.config b/arch/arm64/configs/d2xks.config
+--- a/arch/arm64/configs/d2xks.config
++++ b/arch/arm64/configs/d2xks.config
+@@ -1,5 +1,8 @@
+ # Config file for d2xks
+ # This is merged with exynos9820_defconfig on build
++
++# Security
++CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y
+ 
+ # TZDEV
+ # CONFIG_TZDEV_DEPLOY_OLD_TZAR is not set
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1215,6 +1215,11 @@
+ #define PERF_SECURITY_CPU		1
+ #define PERF_SECURITY_KERNEL		2
+ #define PERF_SECURITY_TRACEPOINT	3
++
++static inline bool perf_paranoid_any(void)
++{
++	return sysctl_perf_event_paranoid > 2;
++}
+ 
+ static inline int perf_is_paranoid(void)
+ {
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -405,8 +405,13 @@
+  *   0 - disallow raw tracepoint access for unpriv
+  *   1 - disallow cpu events for unpriv
+  *   2 - disallow kernel profiling for unpriv
++ *   3 - disallow all unpriv perf event use
+  */
++#ifdef CONFIG_SECURITY_PERF_EVENTS_RESTRICT
++int sysctl_perf_event_paranoid __read_mostly = 3;
++#else
+ int sysctl_perf_event_paranoid __read_mostly = 2;
++#endif
+ 
+ /* Minimum for 512 kiB + 1 user control page */
+ int sysctl_perf_event_mlock __read_mostly = 512 + (PAGE_SIZE / 1024); /* 'free' kiB per user */
+@@ -10528,6 +10533,9 @@
+ 	if (flags & ~PERF_FLAG_ALL)
+ 		return -EINVAL;
+ 
++	if (perf_paranoid_any() && !capable(CAP_SYS_ADMIN))
++		return -EACCES;
++
+ 	err = perf_copy_attr(attr_uptr, &attr);
+ 	if (err)
+ 		return err;
+diff --git a/security/Kconfig b/security/Kconfig
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -17,6 +17,15 @@
+ 	  unless the dmesg_restrict sysctl is explicitly set to (1).
+ 
+ 	  If you are unsure how to answer this question, answer N.
++
++config SECURITY_PERF_EVENTS_RESTRICT
++	bool "Restrict unprivileged use of performance events"
++	depends on PERF_EVENTS
++	help
++	  If you say Y here, the kernel.perf_event_paranoid sysctl
++	  will be set to 3 by default, and no unprivileged use of the
++	  perf_event_open syscall will be permitted unless it is
++	  changed.
+ 
+ config SECURITY
+ 	bool "Enable different security models"
