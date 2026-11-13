@@ -1,0 +1,249 @@
+name: Apply sched uclamp backports
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to update (must match the fixed target below)"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sched-uclamp-backports-ack-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: devandroid-droidspaces-mglru-backports-ack
+  BASE_SHA: 6f9f1b012a2cec71676188816e5143ed2c1ab5a9
+  PATCH_PATH: .github/workflows/sched-uclamp-backports-ack.patch
+  WORKFLOW_PATH: .github/workflows/apply-sched-uclamp-backports-ack.yml
+  PATCH_SHA256: 913d34d9505af4d6f08338398192d34e7b7d6aa97302f4fea1516fbe59c2ae2a
+  SOURCE_TREE: cd434a9ce10589b54b2ce4e2f5268bdcd024dd30
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout dispatched target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate target, patch, and base
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$TARGET_BRANCH" = "devandroid-droidspaces-mglru-backports-ack"
+          test "$GITHUB_REF" = "refs/heads/${TARGET_BRANCH}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$PATCH_PATH"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test "$(grep -c '^From [0-9a-f]\{40\} ' "$PATCH_PATH")" -eq 2
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test -z "$(git status --porcelain)"
+
+      - name: Detect target state
+        run: |
+          set -euo pipefail
+          START_SHA=$(git rev-parse HEAD)
+          BASE_FILES="$RUNNER_TEMP/expected-control-files"
+          ACTUAL_BASE_FILES="$RUNNER_TEMP/actual-control-files"
+          FINAL_FILES="$RUNNER_TEMP/expected-final-files"
+          ACTUAL_FINAL_FILES="$RUNNER_TEMP/actual-final-files"
+
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" | LC_ALL=C sort > "$BASE_FILES"
+
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" \
+            "arch/arm64/configs/exynos9820_defconfig" \
+            "include/linux/sched.h" \
+            "include/linux/sched/sysctl.h" \
+            "include/uapi/linux/sched.h" \
+            "include/uapi/linux/sched/types.h" \
+            "init/Kconfig" \
+            "kernel/sched/core.c" \
+            "kernel/sched/cpufreq_schedutil.c" \
+            "kernel/sched/ems/energy.c" \
+            "kernel/sched/ems/multi_load.c" \
+            "kernel/sched/ems/st_addon.c" \
+            "kernel/sched/fair.c" \
+            "kernel/sched/rt.c" \
+            "kernel/sched/sched.h" \
+            "kernel/sysctl.c" | LC_ALL=C sort > "$FINAL_FILES"
+
+          git diff --name-only "$BASE_SHA" "$START_SHA" | LC_ALL=C sort > "$ACTUAL_BASE_FILES"
+
+          if cmp -s "$BASE_FILES" "$ACTUAL_BASE_FILES" &&
+             git diff --quiet "$BASE_SHA" "$START_SHA" -- . ':(exclude).github/workflows'; then
+            STATE=apply
+            VERIFY_BASE=$START_SHA
+          else
+            diff -u "$FINAL_FILES" "$ACTUAL_BASE_FILES"
+            SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-detect"
+            rm -f "$SOURCE_INDEX"
+            GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree "$START_SHA"
+            GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q "$WORKFLOW_PATH" "$PATCH_PATH"
+            test "$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree --missing-ok)" = "$SOURCE_TREE"
+            rm -f "$SOURCE_INDEX"
+            VERIFY_BASE=$(git rev-parse "${START_SHA}~2")
+            test "$(git rev-list --count "$VERIFY_BASE..$START_SHA")" -eq 2
+            STATE=already-applied
+          fi
+
+          echo "START_SHA=$START_SHA" >> "$GITHUB_ENV"
+          echo "VERIFY_BASE=$VERIFY_BASE" >> "$GITHUB_ENV"
+          echo "STATE=$STATE" >> "$GITHUB_ENV"
+          echo "Detected state: $STATE"
+          echo "Start commit: $START_SHA"
+          echo "Backport base: $VERIFY_BASE"
+
+      - name: Apply patch in place
+        if: env.STATE == 'apply'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git am --keep-cr "$PATCH_PATH"; then
+            git am --abort || true
+            exit 1
+          fi
+
+      - name: Verify two backports
+        run: |
+          set -euo pipefail
+          test -n "$VERIFY_BASE"
+          test "$(git rev-list --count "$VERIFY_BASE..HEAD")" -eq 2
+          test "$(git rev-list --merges --count "$VERIFY_BASE..HEAD")" -eq 0
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git -c core.whitespace=cr-at-eol diff --check "$VERIFY_BASE" HEAD
+          git diff --quiet "$START_SHA" HEAD -- .github/workflows
+
+          SOURCE_FILES="$RUNNER_TEMP/expected-source-files"
+          ACTUAL_SOURCE_FILES="$RUNNER_TEMP/actual-source-files"
+          printf '%s\n' \
+            "arch/arm64/configs/exynos9820_defconfig" \
+            "include/linux/sched.h" \
+            "include/linux/sched/sysctl.h" \
+            "include/uapi/linux/sched.h" \
+            "include/uapi/linux/sched/types.h" \
+            "init/Kconfig" \
+            "kernel/sched/core.c" \
+            "kernel/sched/cpufreq_schedutil.c" \
+            "kernel/sched/ems/energy.c" \
+            "kernel/sched/ems/multi_load.c" \
+            "kernel/sched/ems/st_addon.c" \
+            "kernel/sched/fair.c" \
+            "kernel/sched/rt.c" \
+            "kernel/sched/sched.h" \
+            "kernel/sysctl.c" | LC_ALL=C sort > "$SOURCE_FILES"
+          git diff --name-only "$VERIFY_BASE" HEAD | LC_ALL=C sort > "$ACTUAL_SOURCE_FILES"
+          diff -u "$SOURCE_FILES" "$ACTUAL_SOURCE_FILES"
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-verify"
+          rm -f "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree HEAD
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q "$WORKFLOW_PATH" "$PATCH_PATH"
+          test "$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree --missing-ok)" = "$SOURCE_TREE"
+          rm -f "$SOURCE_INDEX"
+
+          FINAL_FILES="$RUNNER_TEMP/expected-final-files"
+          ACTUAL_FINAL_FILES="$RUNNER_TEMP/actual-final-files"
+          printf '%s\n' \
+            "$WORKFLOW_PATH" \
+            "$PATCH_PATH" \
+            "arch/arm64/configs/exynos9820_defconfig" \
+            "include/linux/sched.h" \
+            "include/linux/sched/sysctl.h" \
+            "include/uapi/linux/sched.h" \
+            "include/uapi/linux/sched/types.h" \
+            "init/Kconfig" \
+            "kernel/sched/core.c" \
+            "kernel/sched/cpufreq_schedutil.c" \
+            "kernel/sched/ems/energy.c" \
+            "kernel/sched/ems/multi_load.c" \
+            "kernel/sched/ems/st_addon.c" \
+            "kernel/sched/fair.c" \
+            "kernel/sched/rt.c" \
+            "kernel/sched/sched.h" \
+            "kernel/sysctl.c" | LC_ALL=C sort > "$FINAL_FILES"
+          git diff --name-only "$BASE_SHA" HEAD | LC_ALL=C sort > "$ACTUAL_FINAL_FILES"
+          diff -u "$FINAL_FILES" "$ACTUAL_FINAL_FILES"
+
+          cat > "$RUNNER_TEMP/expected-subjects" <<'EOF'
+          BACKPORT: sched/uclamp: add utilization clamping support
+          BACKPORT: sched/ems: apply uclamp to Samsung EMS placement
+          EOF
+          git log --reverse --format='%s' "$VERIFY_BASE..HEAD" > "$RUNNER_TEMP/actual-subjects"
+          diff -u "$RUNNER_TEMP/expected-subjects" "$RUNNER_TEMP/actual-subjects"
+
+          git log --reverse --format='%an <%ae>' "$VERIFY_BASE..HEAD" > "$RUNNER_TEMP/actual-authors"
+          cat > "$RUNNER_TEMP/expected-authors" <<'EOF'
+          Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+          Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+          EOF
+          diff -u "$RUNNER_TEMP/expected-authors" "$RUNNER_TEMP/actual-authors"
+
+          git log "$VERIFY_BASE..HEAD" --format=%B > "$RUNNER_TEMP/commit-bodies"
+          test "$(grep -Fxc 'Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>' "$RUNNER_TEMP/commit-bodies")" -eq 2
+          test "$(grep -Fxc 'Author: @Devandroid-bit.' "$RUNNER_TEMP/commit-bodies")" -eq 2
+          test "$(grep -Fc 'd062c36c86f72dbf22ab028ca17d6b88d2173a55' "$RUNNER_TEMP/commit-bodies")" -eq 1
+          test "$(grep -Fc '0213b7083e81f4acd69db32cb72eb4e5f220329a' "$RUNNER_TEMP/commit-bodies")" -eq 1
+
+          git log --oneline "$VERIFY_BASE..HEAD"
+
+      - name: Push target branch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          REMOTE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index-remote"
+          rm -f "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git read-tree "$REMOTE_SHA"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q --ignore-unmatch "$WORKFLOW_PATH" "$PATCH_PATH"
+          REMOTE_SOURCE_TREE=$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree --missing-ok)
+          rm -f "$SOURCE_INDEX"
+
+          if [ "$REMOTE_SHA" = "$HEAD_SHA" ]; then
+            RESULT_SHA=$REMOTE_SHA
+            echo "Target branch already has the expected commit; nothing to push."
+          elif [ "$REMOTE_SHA" = "$START_SHA" ]; then
+            git merge-base --is-ancestor "$REMOTE_SHA" "$HEAD_SHA"
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+            test "$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")" = "$HEAD_SHA"
+            RESULT_SHA=$HEAD_SHA
+          elif git merge-base --is-ancestor "$START_SHA" "$REMOTE_SHA" &&
+               test "$(git rev-list --count "$START_SHA..$REMOTE_SHA")" -eq 2 &&
+               test "$REMOTE_SOURCE_TREE" = "$SOURCE_TREE" &&
+               git diff --quiet "$START_SHA" "$REMOTE_SHA" -- .github/workflows; then
+            RESULT_SHA=$REMOTE_SHA
+            echo "Target branch already has the expected backports; nothing to push."
+          else
+            echo "::error::Target branch changed during workflow; expected $START_SHA or $HEAD_SHA, found $REMOTE_SHA."
+            exit 1
+          fi
+
+          echo "### sched uclamp backports applied" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- State: \`${STATE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Start commit: \`${START_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Result commit: \`${RESULT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Patch SHA256: \`${PATCH_SHA256}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits:" >> "$GITHUB_STEP_SUMMARY"
+          git log --format='- `%h` %s' "$VERIFY_BASE..$RESULT_SHA" >> "$GITHUB_STEP_SUMMARY"
