@@ -3680,6 +3680,10 @@ const struct sched_class rt_sched_class = {
 
 	.check_preempt_curr	= check_preempt_curr_rt,
 
+#ifdef CONFIG_UCLAMP_TASK
+	.uclamp_enabled		= 1,
+#endif
+
 	.pick_next_task		= pick_next_task_rt,
 	.put_prev_task		= put_prev_task_rt,
 

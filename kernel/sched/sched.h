@@ -372,6 +372,17 @@ struct task_group {
 #endif
 
 	struct cfs_bandwidth cfs_bandwidth;
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	/* The two decimal precision [%] value requested from user-space */
+	unsigned int		uclamp_pct[UCLAMP_CNT];
+	/* Clamp values requested for a task group */
+	struct uclamp_se	uclamp_req[UCLAMP_CNT];
+	/* Effective clamp values used for a task group */
+	struct uclamp_se	uclamp[UCLAMP_CNT];
+	/* Latency-sensitive flag used for a task group */
+	unsigned int		latency_sensitive;
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -754,6 +765,36 @@ extern void rto_push_irq_work_func(struct irq_work *work);
  * (such as the load balancing or the thread migration code), lock
  * acquire operations must be ordered by ascending &runqueue.
  */
+#ifdef CONFIG_UCLAMP_TASK
+/**
+ * struct uclamp_bucket - Utilization clamp bucket
+ * @value: utilization clamp value for tasks managed by this bucket
+ * @tasks: number of RUNNABLE tasks on this bucket
+ */
+struct uclamp_bucket {
+	unsigned long value;
+	unsigned int tasks;
+};
+
+/**
+ * struct uclamp_rq - rq's utilization clamp
+ * @value: currently active clamp values for a rq
+ * @bucket: utilization clamp buckets affecting a rq
+ */
+struct uclamp_rq {
+	unsigned int value;
+	struct uclamp_bucket bucket[UCLAMP_BUCKETS];
+};
+#endif /* CONFIG_UCLAMP_TASK */
+
+/* rq->uclamp_flags: idle state retains the last max clamp */
+#define UCLAMP_FLAG_IDLE	0x01
+
+#ifdef CONFIG_UCLAMP_TASK
+extern unsigned int uclamp_eff_value(struct task_struct *p,
+				     enum uclamp_id clamp_id);
+#endif
+
 struct rq {
 	/* runqueue lock: */
 	raw_spinlock_t lock;
@@ -914,6 +955,11 @@ struct rq {
 	/* Must be inspected within a rcu lock section */
 	struct cpuidle_state *idle_state;
 	int idle_state_idx;
+#endif
+#ifdef CONFIG_UCLAMP_TASK
+	/* Utilization clamp values and buckets for RUNNABLE tasks */
+	struct uclamp_rq		uclamp[UCLAMP_CNT];
+	unsigned int			uclamp_flags;
 #endif
 };
 
@@ -1680,6 +1726,13 @@ struct sched_class {
 					      struct task_struct *task,
 					      u64 new_task_load);
 #endif
+#ifdef CONFIG_UCLAMP_TASK
+	/*
+	 * Set for scheduling classes whose tasks carry utilization clamps:
+	 * currently fair and RT.
+	 */
+	int uclamp_enabled;
+#endif
 };
 
 static inline void put_prev_task(struct rq *rq, struct task_struct *prev)
@@ -2371,3 +2424,81 @@ walt_task_in_cum_window_demand(struct rq *rq, struct task_struct *p)
 #else /* arch_scale_freq_capacity */
 #define arch_scale_freq_invariant()	(false)
 #endif
+
+#ifdef CONFIG_UCLAMP_TASK
+/**
+ * uclamp_util_with - clamp @util with @rq and @p effective uclamp values.
+ * @rq:		the rq to read the clamp values from.
+ * @util:	the utilization to clamp.
+ * @p:		the task whose clamp values are used; may be NULL.
+ *
+ * Clamp the passed utilization with the rq's clamp value and, when a task
+ * is given, its effective clamp. Only schedutil calls this, to raise or cap
+ * the frequency a task's hint asks for.
+ */
+static __always_inline unsigned int
+uclamp_util_with(struct rq *rq, unsigned int util, struct task_struct *p)
+{
+	unsigned int min_util = READ_ONCE(rq->uclamp[UCLAMP_MIN].value);
+	unsigned int max_util = READ_ONCE(rq->uclamp[UCLAMP_MAX].value);
+
+	if (p) {
+		min_util = max(min_util, uclamp_eff_value(p, UCLAMP_MIN));
+		max_util = max(max_util, uclamp_eff_value(p, UCLAMP_MAX));
+	}
+
+	/*
+	 * Since CPU's {min,max}_util clamps are MAX aggregated considering
+	 * RUNNABLE tasks with _different_ clamps, we can end up with an
+	 * inversion. Fix it now when the clamps are applied.
+	 */
+	if (unlikely(min_util >= max_util))
+		return min_util;
+
+	return clamp(util, min_util, max_util);
+}
+
+/* Is the rq's utilization clamped by any task? */
+static inline bool uclamp_rq_is_idle(struct rq *rq)
+{
+	return rq->uclamp_flags == UCLAMP_FLAG_IDLE;
+}
+
+static inline unsigned int uclamp_util(struct rq *rq, unsigned int util)
+{
+	return uclamp_util_with(rq, util, NULL);
+}
+#else /* CONFIG_UCLAMP_TASK */
+static inline unsigned int
+uclamp_util_with(struct rq *rq, unsigned int util, struct task_struct *p)
+{
+	return util;
+}
+
+static inline bool uclamp_rq_is_idle(struct rq *rq)
+{
+	return false;
+}
+
+static inline unsigned int uclamp_util(struct rq *rq, unsigned int util)
+{
+	return util;
+}
+#endif /* CONFIG_UCLAMP_TASK */
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+static inline bool uclamp_latency_sensitive(struct task_struct *p)
+{
+	struct task_group *tg = task_group(p);
+
+	if (!tg || tg == &root_task_group || task_group_is_autogroup(tg))
+		return false;
+
+	return tg->latency_sensitive;
+}
+#else /* CONFIG_UCLAMP_TASK_GROUP */
+static inline bool uclamp_latency_sensitive(struct task_struct *p)
+{
+	return false;
+}
+#endif /* CONFIG_UCLAMP_TASK_GROUP */
