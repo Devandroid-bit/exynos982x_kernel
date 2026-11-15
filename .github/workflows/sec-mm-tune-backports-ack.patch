@@ -1,0 +1,354 @@
+From 119ce4e306fcdfb2cf3fe75a457774c90329a5e3 Mon Sep 17 00:00:00 2001
+From: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:04:08 +0100
+Subject: [PATCH] BACKPORT: mm: add S26 sec_mm_tune swap-in dedup and shrinker
+ bypass
+
+Backport the phase-1 subset of Samsung's sec_mm_tune implementation
+from the Galaxy S26 Exynos 2600 6.12.69 source tree
+(exynos/soc-series/common/mm/sec_mm/sec_mm_tune.c).
+
+Adapt it to the 4.14 Exynos9820/9825 tree:
+- replace the vendor hook registrations with direct calls from the
+  existing 4.14 reclaim and swap-cache paths;
+- implement swap-in deduplication around swapcache_prepare() in
+  __read_swap_cache_async(), because 4.14 does not provide the
+  SWP_SYNCHRONOUS_IO direct-swap path used by S26;
+- start tracking before swapcache_prepare() so a concurrent -EEXIST
+  waiter cannot miss the owner; reschedule when no tracked insertion is
+  in flight, because the swap-out path can also own SWAP_HAS_CACHE;
+- bypass shrink_slab() only for non-kswapd reclaim with priority > 0,
+  at the existing shrink_node() call sites;
+- leave the zsmalloc throttling, mem_boost sysfs interface and
+  drain_all_pages logic unchanged, as they are already present;
+- omit the S26 pcplist batch cap because zone_batchsize() already
+  caps the batch below the S26 limit in this tree.
+
+Enable CONFIG_SEC_MM_TUNE in exynos9820_defconfig. The device fragment
+configs are merged after this defconfig by build.sh, so no redundant
+fragment changes are needed.
+
+Source: Samsung Galaxy S26 Exynos 2600 kernel 6.12.69,
+exynos/soc-series/common/mm/sec_mm/sec_mm_tune.c.
+
+Author: @Devandroid-bit.
+---
+ arch/arm64/configs/exynos9820_defconfig |  1 +
+ include/linux/sec_mm_tune.h             | 32 +++++++++
+ mm/sec_mm/Kconfig                       | 13 ++++
+ mm/sec_mm/Makefile                      |  1 +
+ mm/sec_mm/sec_mm.h                      | 13 ++++
+ mm/sec_mm/sec_mm_init.c                 |  2 +
+ mm/sec_mm/sec_mm_tune.c                 | 94 +++++++++++++++++++++++++
+ mm/swap_state.c                         |  8 ++-
+ mm/vmscan.c                             |  6 +-
+ 9 files changed, 167 insertions(+), 3 deletions(-)
+ create mode 100644 include/linux/sec_mm_tune.h
+ create mode 100644 mm/sec_mm/sec_mm_tune.c
+
+diff --git a/arch/arm64/configs/exynos9820_defconfig b/arch/arm64/configs/exynos9820_defconfig
+index c733f45..63b45c2 100644
+--- a/arch/arm64/configs/exynos9820_defconfig
++++ b/arch/arm64/configs/exynos9820_defconfig
+@@ -619,6 +619,7 @@ CONFIG_PROCESS_RECLAIM=y
+ # SEC Memory Management Options
+ #
+ CONFIG_SEC_MM=y
++CONFIG_SEC_MM_TUNE=y
+ CONFIG_SECCOMP=y
+ # CONFIG_PARAVIRT is not set
+ # CONFIG_PARAVIRT_TIME_ACCOUNTING is not set
+diff --git a/include/linux/sec_mm_tune.h b/include/linux/sec_mm_tune.h
+new file mode 100644
+index 0000000..b2cb029
+--- /dev/null
++++ b/include/linux/sec_mm_tune.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_SEC_MM_TUNE_H
++#define _LINUX_SEC_MM_TUNE_H
++
++#include <linux/types.h>
++#include <linux/swap.h>
++
++#ifdef CONFIG_SEC_MM_TUNE
++void sec_mm_swapin_start(swp_entry_t entry);
++void sec_mm_swapin_done(swp_entry_t entry);
++void sec_mm_swapin_wait(swp_entry_t entry);
++bool sec_mm_shrink_slab_bypass(int priority);
++#else
++static inline void sec_mm_swapin_start(swp_entry_t entry)
++{
++}
++
++static inline void sec_mm_swapin_done(swp_entry_t entry)
++{
++}
++
++static inline void sec_mm_swapin_wait(swp_entry_t entry)
++{
++}
++
++static inline bool sec_mm_shrink_slab_bypass(int priority)
++{
++	return false;
++}
++#endif
++
++#endif /* _LINUX_SEC_MM_TUNE_H */
+diff --git a/mm/sec_mm/Kconfig b/mm/sec_mm/Kconfig
+index 02f19b8..0f43f0a 100644
+--- a/mm/sec_mm/Kconfig
++++ b/mm/sec_mm/Kconfig
+@@ -6,4 +6,17 @@ config SEC_MM
+ 	help
+ 	  SEC memory management module
+ 
++config SEC_MM_TUNE
++	bool "Enable SEC MM tuning"
++	depends on SEC_MM=y
++	default y
++	help
++	  Enable Samsung memory reclaim and swap-in tuning adapted from
++	  the S26 sec_mm_tune implementation.
++
++	  This adds swap-in waitqueue deduplication and a direct reclaim
++	  shrinker bypass for Exynos9820/9825 devices.
++
++	  If unsure, say Y.
++
+ endmenu
+diff --git a/mm/sec_mm/Makefile b/mm/sec_mm/Makefile
+index 1e27265..ec8ab32 100644
+--- a/mm/sec_mm/Makefile
++++ b/mm/sec_mm/Makefile
+@@ -2,3 +2,4 @@
+ #
+ obj-$(CONFIG_SEC_MM)		:= sec_mm.o
+ sec_mm-objs			:= sec_mm_init.o lowfile_detect.o panic_handler.o show_mem.o
++sec_mm-$(CONFIG_SEC_MM_TUNE)	+= sec_mm_tune.o
+diff --git a/mm/sec_mm/sec_mm.h b/mm/sec_mm/sec_mm.h
+index 93052ae..716e852 100644
+--- a/mm/sec_mm/sec_mm.h
++++ b/mm/sec_mm/sec_mm.h
+@@ -15,4 +15,17 @@ void exit_lowfile_detect(void);
+ void init_panic_handler(void);
+ void exit_panic_handler(void);
+ 
++#ifdef CONFIG_SEC_MM_TUNE
++void init_sec_mm_tune(void);
++void exit_sec_mm_tune(void);
++#else
++static inline void init_sec_mm_tune(void)
++{
++}
++
++static inline void exit_sec_mm_tune(void)
++{
++}
++#endif
++
+ #endif /* _SEC_MM_DEBUG_H */
+diff --git a/mm/sec_mm/sec_mm_init.c b/mm/sec_mm/sec_mm_init.c
+index 3ed26b8..35df77a 100644
+--- a/mm/sec_mm/sec_mm_init.c
++++ b/mm/sec_mm/sec_mm_init.c
+@@ -13,6 +13,7 @@ static int __init sec_mm_init(void)
+ {
+ 	init_lowfile_detect();
+ 	init_panic_handler();
++	init_sec_mm_tune();
+ 	pr_info("sec_mm init was done\n");
+ 	return 0;
+ }
+@@ -21,6 +22,7 @@ static void __exit sec_mm_exit(void)
+ {
+ 	exit_lowfile_detect();
+ 	exit_panic_handler();
++	exit_sec_mm_tune();
+ }
+ 
+ module_init(sec_mm_init);
+diff --git a/mm/sec_mm/sec_mm_tune.c b/mm/sec_mm/sec_mm_tune.c
+new file mode 100644
+index 0000000..0ee11a8
+--- /dev/null
++++ b/mm/sec_mm/sec_mm_tune.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/atomic.h>
++#include <linux/bitops.h>
++#include <linux/hash.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/sec_mm_tune.h>
++#include <linux/swap.h>
++#include <linux/swapops.h>
++#include <linux/wait.h>
++
++#include "sec_mm.h"
++
++#define NR_SWAP_HASH_BITS	8
++#define NR_SWAP_WAITQUEUE	BIT(NR_SWAP_HASH_BITS)
++
++static wait_queue_head_t swap_waitqueue[NR_SWAP_WAITQUEUE];
++static atomic_t swapin_inflight[NR_SWAP_WAITQUEUE];
++static bool sec_mm_tune_ready;
++
++static int sec_mm_swap_hash_idx(swp_entry_t entry)
++{
++	return hash_long(swp_offset(entry), NR_SWAP_HASH_BITS);
++}
++
++void sec_mm_swapin_start(swp_entry_t entry)
++{
++	if (!sec_mm_tune_ready)
++		return;
++	atomic_inc(&swapin_inflight[sec_mm_swap_hash_idx(entry)]);
++}
++
++void sec_mm_swapin_done(swp_entry_t entry)
++{
++	int idx;
++
++	if (!sec_mm_tune_ready)
++		return;
++
++	idx = sec_mm_swap_hash_idx(entry);
++	atomic_dec(&swapin_inflight[idx]);
++	wake_up(&swap_waitqueue[idx]);
++}
++
++void sec_mm_swapin_wait(swp_entry_t entry)
++{
++	DEFINE_WAIT(wait);
++	int idx;
++
++	if (!sec_mm_tune_ready) {
++		cond_resched();
++		return;
++	}
++
++	idx = sec_mm_swap_hash_idx(entry);
++	if (!atomic_read(&swapin_inflight[idx])) {
++		cond_resched();
++		return;
++	}
++
++	prepare_to_wait(&swap_waitqueue[idx], &wait, TASK_UNINTERRUPTIBLE);
++	if (atomic_read(&swapin_inflight[idx]))
++		schedule();
++	finish_wait(&swap_waitqueue[idx], &wait);
++}
++
++bool sec_mm_shrink_slab_bypass(int priority)
++{
++	if (!sec_mm_tune_ready)
++		return false;
++
++	return !current_is_kswapd() && priority > 0;
++}
++
++void init_sec_mm_tune(void)
++{
++	int i;
++
++	for (i = 0; i < NR_SWAP_WAITQUEUE; i++)
++		init_waitqueue_head(&swap_waitqueue[i]);
++
++	sec_mm_tune_ready = true;
++}
++
++void exit_sec_mm_tune(void)
++{
++	int i;
++
++	sec_mm_tune_ready = false;
++
++	for (i = 0; i < NR_SWAP_WAITQUEUE; i++)
++		wake_up_all(&swap_waitqueue[i]);
++}
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 75710e4..02d0f0e 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -22,6 +22,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/swap_slots.h>
+ #include <linux/huge_mm.h>
++#include <linux/sec_mm_tune.h>
+ 
+ #include <asm/pgtable.h>
+ #include "internal.h"
+@@ -478,19 +479,22 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 		/*
+ 		 * Swap entry may have been freed since our caller observed it.
+ 		 */
++		sec_mm_swapin_start(entry);
+ 		err = swapcache_prepare(entry);
+ 		if (err == -EEXIST) {
+ 			radix_tree_preload_end();
++			sec_mm_swapin_done(entry);
+ 			/*
+ 			 * We might race against get_swap_page() and stumble
+ 			 * across a SWAP_HAS_CACHE swap_map entry whose page
+ 			 * has not been brought into the swapcache yet.
+ 			 */
+-			cond_resched();
++			sec_mm_swapin_wait(entry);
+ 			continue;
+ 		}
+ 		if (err) {		/* swp entry is obsolete ? */
+ 			radix_tree_preload_end();
++			sec_mm_swapin_done(entry);
+ 			break;
+ 		}
+ 
+@@ -509,6 +513,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 				lru_gen_refault(new_page, shadow);
+ 			lru_cache_add_anon(new_page);
+ 			*new_page_allocated = true;
++			sec_mm_swapin_done(entry);
+ 			return new_page;
+ 		}
+ 		radix_tree_preload_end();
+@@ -518,6 +523,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 		 * clear SWAP_HAS_CACHE flag.
+ 		 */
+ 		put_swap_page(new_page, entry);
++		sec_mm_swapin_done(entry);
+ 	} while (err != -ENOMEM);
+ 
+ 	if (new_page)
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 00eb484..d30b6d4 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -53,6 +53,7 @@
+ #include <linux/pagevec.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/ctype.h>
++#include <linux/sec_mm_tune.h>
+ #ifdef CONFIG_DEBUG_FS
+ #include <linux/debugfs.h>
+ #endif
+@@ -5757,7 +5758,7 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 			shrink_node_memcg(pgdat, memcg, sc, &lru_pages);
+ 			node_lru_pages += lru_pages;
+ 
+-			if (memcg)
++			if (memcg && !sec_mm_shrink_slab_bypass(sc->priority))
+ 				shrink_slab(sc->gfp_mask, pgdat->node_id,
+ 					    memcg, sc->nr_scanned - scanned,
+ 					    lru_pages);
+@@ -5788,7 +5789,8 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 		 * Shrink the slab caches in the same proportion that
+ 		 * the eligible LRU pages were scanned.
+ 		 */
+-		if (global_reclaim(sc))
++		if (global_reclaim(sc) &&
++		    !sec_mm_shrink_slab_bypass(sc->priority))
+ 			shrink_slab(sc->gfp_mask, pgdat->node_id, NULL,
+ 				    sc->nr_scanned - nr_scanned,
+ 				    node_lru_pages);
