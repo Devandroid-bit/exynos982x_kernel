@@ -53,6 +53,7 @@
 #include <linux/pagevec.h>
 #include <linux/shmem_fs.h>
 #include <linux/ctype.h>
+#include <linux/sec_mm_tune.h>
 #ifdef CONFIG_DEBUG_FS
 #include <linux/debugfs.h>
 #endif
@@ -5757,7 +5758,7 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			shrink_node_memcg(pgdat, memcg, sc, &lru_pages);
 			node_lru_pages += lru_pages;
 
-			if (memcg)
+			if (memcg && !sec_mm_shrink_slab_bypass(sc->priority))
 				shrink_slab(sc->gfp_mask, pgdat->node_id,
 					    memcg, sc->nr_scanned - scanned,
 					    lru_pages);
@@ -5788,7 +5789,8 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		 * Shrink the slab caches in the same proportion that
 		 * the eligible LRU pages were scanned.
 		 */
-		if (global_reclaim(sc))
+		if (global_reclaim(sc) &&
+		    !sec_mm_shrink_slab_bypass(sc->priority))
 			shrink_slab(sc->gfp_mask, pgdat->node_id, NULL,
 				    sc->nr_scanned - nr_scanned,
 				    node_lru_pages);

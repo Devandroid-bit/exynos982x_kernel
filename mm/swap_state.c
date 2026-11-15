@@ -22,6 +22,7 @@
 #include <linux/vmalloc.h>
 #include <linux/swap_slots.h>
 #include <linux/huge_mm.h>
+#include <linux/sec_mm_tune.h>
 
 #include <asm/pgtable.h>
 #include "internal.h"
@@ -478,19 +479,22 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		/*
 		 * Swap entry may have been freed since our caller observed it.
 		 */
+		sec_mm_swapin_start(entry);
 		err = swapcache_prepare(entry);
 		if (err == -EEXIST) {
 			radix_tree_preload_end();
+			sec_mm_swapin_done(entry);
 			/*
 			 * We might race against get_swap_page() and stumble
 			 * across a SWAP_HAS_CACHE swap_map entry whose page
 			 * has not been brought into the swapcache yet.
 			 */
-			cond_resched();
+			sec_mm_swapin_wait(entry);
 			continue;
 		}
 		if (err) {		/* swp entry is obsolete ? */
 			radix_tree_preload_end();
+			sec_mm_swapin_done(entry);
 			break;
 		}
 
@@ -509,6 +513,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 				lru_gen_refault(new_page, shadow);
 			lru_cache_add_anon(new_page);
 			*new_page_allocated = true;
+			sec_mm_swapin_done(entry);
 			return new_page;
 		}
 		radix_tree_preload_end();
@@ -518,6 +523,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		 * clear SWAP_HAS_CACHE flag.
 		 */
 		put_swap_page(new_page, entry);
+		sec_mm_swapin_done(entry);
 	} while (err != -ENOMEM);
 
 	if (new_page)

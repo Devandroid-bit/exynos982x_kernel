@@ -6,4 +6,17 @@ config SEC_MM
 	help
 	  SEC memory management module
 
+config SEC_MM_TUNE
+	bool "Enable SEC MM tuning"
+	depends on SEC_MM=y
+	default y
+	help
+	  Enable Samsung memory reclaim and swap-in tuning adapted from
+	  the S26 sec_mm_tune implementation.
+
+	  This adds swap-in waitqueue deduplication and a direct reclaim
+	  shrinker bypass for Exynos9820/9825 devices.
+
+	  If unsure, say Y.
+
 endmenu

@@ -15,4 +15,17 @@ void exit_lowfile_detect(void);
 void init_panic_handler(void);
 void exit_panic_handler(void);
 
+#ifdef CONFIG_SEC_MM_TUNE
+void init_sec_mm_tune(void);
+void exit_sec_mm_tune(void);
+#else
+static inline void init_sec_mm_tune(void)
+{
+}
+
+static inline void exit_sec_mm_tune(void)
+{
+}
+#endif
+
 #endif /* _SEC_MM_DEBUG_H */
