@@ -237,6 +237,7 @@ static void reset_cached_positions(struct zone *zone)
 	zone->compact_cached_migrate_pfn[1] = zone->zone_start_pfn;
 	zone->compact_cached_free_pfn =
 				pageblock_start_pfn(zone_end_pfn(zone) - 1);
+	zone->compact_init_free_pfn = zone->compact_cached_free_pfn;
 }
 
 /*
@@ -1026,12 +1027,14 @@ static bool suitable_migration_target(struct compact_control *cc,
 {
 	/* If the page is a large free page, then disallow migration */
 	if (PageBuddy(page)) {
+		int order = cc->order > 0 ? cc->order : pageblock_order;
+
 		/*
 		 * We are checking page_order without zone->lock taken. But
 		 * the only small danger is that we skip a potentially suitable
 		 * pageblock, so it's not worth to check order for valid range.
 		 */
-		if (page_order_unsafe(page) >= pageblock_order)
+		if (page_order_unsafe(page) >= order)
 			return false;
 	}
 
@@ -1044,6 +1047,247 @@ static bool suitable_migration_target(struct compact_control *cc,
 
 	/* Otherwise skip the block */
 	return false;
+}
+
+static inline unsigned int
+freelist_scan_limit(struct compact_control *cc)
+{
+	unsigned short shift = BITS_PER_LONG - 1;
+
+	return (COMPACT_CLUSTER_MAX >> min(shift, cc->fast_search_fail)) + 1;
+}
+
+/*
+ * Used when scanning for a suitable migration target which scans freelists
+ * in reverse. Reorders the list so the unscanned pages are scanned first on
+ * the next iteration of the free scanner.
+ */
+static void
+move_freelist_head(struct list_head *freelist, struct page *freepage)
+{
+	LIST_HEAD(sublist);
+
+	if (!list_empty(freelist) && freelist->next != &freepage->lru) {
+		list_cut_before(&sublist, freelist, &freepage->lru);
+		list_splice_tail(&sublist, freelist);
+	}
+}
+
+static void
+fast_isolate_around(struct compact_control *cc, unsigned long pfn)
+{
+	unsigned long start_pfn, end_pfn;
+	struct page *page;
+
+	/* Do not search around if there are enough pages already */
+	if (cc->nr_freepages >= cc->nr_migratepages)
+		return;
+
+	/* Minimise scanning during async compaction */
+	if (cc->direct_compaction && cc->mode == MIGRATE_ASYNC)
+		return;
+
+	/* Pageblock boundaries */
+	start_pfn = max(pageblock_start_pfn(pfn), cc->zone->zone_start_pfn);
+	end_pfn = min(pageblock_end_pfn(pfn), zone_end_pfn(cc->zone));
+
+	page = pageblock_pfn_to_page(start_pfn, end_pfn, cc->zone);
+	if (!page)
+		return;
+
+	isolate_freepages_block(cc, &start_pfn, end_pfn, &cc->freepages, false);
+
+	/* Skip this pageblock in the future as it's full or nearly full */
+	if (start_pfn == end_pfn && !cc->ignore_skip_hint)
+		set_pageblock_skip(page);
+}
+
+/* Search orders in round-robin fashion */
+static int next_search_order(struct compact_control *cc, int order)
+{
+	order--;
+	if (order < 0)
+		order = cc->order - 1;
+
+	/* Search wrapped around? */
+	if (order == cc->search_order) {
+		cc->search_order--;
+		if (cc->search_order < 0)
+			cc->search_order = cc->order - 1;
+		return -1;
+	}
+
+	return order;
+}
+
+static void fast_isolate_freepages(struct compact_control *cc)
+{
+	unsigned int limit = max(1U, freelist_scan_limit(cc) >> 1);
+	unsigned int nr_scanned = 0, total_isolated = 0;
+	unsigned long low_pfn, min_pfn, highest = 0;
+	unsigned long nr_isolated = 0;
+	unsigned long distance;
+	struct page *page = NULL;
+	bool scan_start = false;
+	int order;
+
+	/* Full compaction passes in a negative order */
+	if (cc->order <= 0)
+		return;
+
+	/*
+	 * If starting the scan, use a deeper search and use the highest
+	 * PFN found if a suitable one is not found.
+	 */
+	if (cc->free_pfn >= cc->zone->compact_init_free_pfn) {
+		limit = pageblock_nr_pages >> 1;
+		scan_start = true;
+	}
+
+	/*
+	 * Preferred point is in the top quarter of the scan space but take
+	 * a pfn from the top half if the search is problematic.
+	 */
+	distance = (cc->free_pfn - cc->migrate_pfn);
+	low_pfn = pageblock_start_pfn(cc->free_pfn - (distance >> 2));
+	min_pfn = pageblock_start_pfn(cc->free_pfn - (distance >> 1));
+
+	if (WARN_ON_ONCE(min_pfn > low_pfn))
+		low_pfn = min_pfn;
+
+	/*
+	 * Search starts from the last successful isolation order or the next
+	 * order to search after a previous failure.
+	 */
+	cc->search_order = min_t(unsigned int, cc->order - 1, cc->search_order);
+
+	for (order = cc->search_order;
+	     !page && order >= 0;
+	     order = next_search_order(cc, order)) {
+		struct free_area *area = &cc->zone->free_area[order];
+		struct list_head *freelist;
+		struct page *freepage = NULL;
+		unsigned long flags;
+		unsigned int order_scanned = 0;
+		unsigned long high_pfn = 0;
+
+		if (!area->nr_free)
+			continue;
+
+		spin_lock_irqsave(&cc->zone->lock, flags);
+		freelist = &area->free_list[MIGRATE_MOVABLE];
+		list_for_each_entry_reverse(freepage, freelist, lru) {
+			unsigned long pfn;
+
+			order_scanned++;
+			nr_scanned++;
+			pfn = page_to_pfn(freepage);
+
+			if (pfn >= highest)
+				highest = max(pageblock_start_pfn(pfn),
+					      cc->zone->zone_start_pfn);
+
+			if (pfn >= low_pfn) {
+				cc->fast_search_fail = 0;
+				cc->search_order = order;
+				page = freepage;
+				break;
+			}
+
+			if (pfn >= min_pfn && pfn > high_pfn) {
+				high_pfn = pfn;
+
+				/* Shorten the scan if a candidate is found */
+				limit >>= 1;
+			}
+
+			if (order_scanned >= limit)
+				break;
+		}
+
+		/* Use a maximum candidate pfn if a preferred one was not found */
+		if (!page && high_pfn) {
+			page = pfn_to_page(high_pfn);
+
+			/* Update freepage for the list reorder below */
+			freepage = page;
+		}
+
+		/* Reorder so a future search skips recent pages */
+		if (freepage)
+			move_freelist_head(freelist, freepage);
+
+		/* Isolate the page if available */
+		if (page) {
+			if (__isolate_free_page(page, order)) {
+				set_page_private(page, order);
+				nr_isolated = 1 << order;
+				nr_scanned += nr_isolated - 1;
+				total_isolated += nr_isolated;
+				cc->nr_freepages += nr_isolated;
+				list_add_tail(&page->lru, &cc->freepages);
+				count_compact_events(COMPACTISOLATED, nr_isolated);
+			} else {
+				/* If isolation fails, abort the search */
+				order = cc->search_order + 1;
+				page = NULL;
+			}
+		}
+
+		spin_unlock_irqrestore(&cc->zone->lock, flags);
+
+		/* Skip fast search if enough freepages isolated */
+		if (cc->nr_freepages >= cc->nr_migratepages)
+			break;
+
+		/*
+		 * Smaller scan on next order so the total scan is related
+		 * to freelist_scan_limit.
+		 */
+		if (order_scanned >= limit)
+			limit = max(1U, limit >> 1);
+	}
+
+	trace_mm_compaction_fast_isolate_freepages(min_pfn, cc->free_pfn,
+						   nr_scanned, total_isolated);
+
+	if (!page) {
+		cc->fast_search_fail++;
+		if (scan_start) {
+			/*
+			 * Use the highest PFN found above min. If one was
+			 * not found, be pessimistic for direct compaction
+			 * and use the min mark.
+			 */
+			if (highest >= min_pfn) {
+				page = pfn_to_page(highest);
+				cc->free_pfn = highest;
+			} else {
+				if (cc->direct_compaction && pfn_valid(min_pfn)) {
+					page = pageblock_pfn_to_page(min_pfn,
+								     min(pageblock_end_pfn(min_pfn),
+									 zone_end_pfn(cc->zone)),
+								     cc->zone);
+					if (page && !suitable_migration_target(cc, page))
+						page = NULL;
+
+					cc->free_pfn = min_pfn;
+				}
+			}
+		}
+	}
+
+	if (highest && highest >= cc->zone->compact_cached_free_pfn) {
+		highest -= pageblock_nr_pages;
+		cc->zone->compact_cached_free_pfn = highest;
+	}
+
+	cc->total_free_scanned += nr_scanned;
+	if (!page)
+		return;
+
+	low_pfn = page_to_pfn(page);
+	fast_isolate_around(cc, low_pfn);
 }
 
 /*
@@ -1069,6 +1313,13 @@ static void isolate_freepages(struct compact_control *cc)
 	unsigned long block_end_pfn;	/* end of current pageblock */
 	unsigned long low_pfn;	     /* lowest pfn scanner is able to scan */
 	struct list_head *freelist = &cc->freepages;
+
+	/* Try a small search of the free lists for a candidate */
+	fast_isolate_freepages(cc);
+	if (cc->nr_freepages) {
+		map_pages(freelist);
+		return;
+	}
 
 	/*
 	 * Initialise the free scanner. The starting point is where we last
@@ -1799,6 +2050,7 @@ static enum compact_result compact_zone_order(struct zone *zone, int order,
 	enum compact_result ret;
 	struct compact_control cc = {
 		.order = order,
+		.search_order = order,
 		.gfp_mask = gfp_mask,
 		.zone = zone,
 		.mode = (prio == COMPACT_PRIO_ASYNC) ?
@@ -2073,6 +2325,7 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 	struct zone *zone;
 	struct compact_control cc = {
 		.order = pgdat->kcompactd_max_order,
+		.search_order = pgdat->kcompactd_max_order,
 		.classzone_idx = pgdat->kcompactd_classzone_idx,
 		.mode = MIGRATE_SYNC_LIGHT,
 		.ignore_skip_hint = true,
