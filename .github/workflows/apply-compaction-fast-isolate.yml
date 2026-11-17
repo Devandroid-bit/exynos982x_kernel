@@ -1,0 +1,190 @@
+name: Apply compaction fast-isolate backport
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to apply and push (must match the fixed target below)"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compaction-fast-isolate-backports-ack-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: devandroid-droidspaces-mglru-backports-ack
+  PATCH_PATH: .github/workflows/compaction-fast-isolate.patch
+  WORKFLOW_PATH: .github/workflows/apply-compaction-fast-isolate.yml
+  PATCH_SHA256: 4f785ff287b3bb52061b5c14e149703f523e42d2a597aa8ca455cc72a1f94144
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout dispatched target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate target and patch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$TARGET_BRANCH" = "devandroid-droidspaces-mglru-backports-ack"
+          test "$GITHUB_REF" = "refs/heads/${TARGET_BRANCH}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$PATCH_PATH"
+          test -f "$WORKFLOW_PATH"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test -z "$(git status --porcelain)"
+
+      - name: Detect state and apply
+        run: |
+          set -euo pipefail
+          START_SHA=$(git rev-parse HEAD)
+          PATCH_SUBJECT='BACKPORT: mm, compaction: use free lists to quickly locate a migration target'
+
+          if git apply --check "$PATCH_PATH" >/dev/null 2>&1; then
+            STATE=apply
+          elif git apply --reverse --check "$PATCH_PATH" >/dev/null 2>&1; then
+            STATE=already-applied
+          else
+            echo "Patch is neither applicable nor already applied." >&2
+            exit 1
+          fi
+
+          if [ "$STATE" = "apply" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git am --keep-cr "$PATCH_PATH"
+            BASE_SHA=$START_SHA
+            PATCH_COMMIT=$(git rev-parse HEAD)
+          else
+            PATCH_COMMIT=$(git log --format='%H%x09%s' -n 200 | awk -F '\t' -v subject="$PATCH_SUBJECT" '$2 == subject { print $1; exit }')
+            test -n "$PATCH_COMMIT"
+            BASE_SHA=$(git rev-parse "${PATCH_COMMIT}~1")
+          fi
+
+          echo "START_SHA=$START_SHA" >> "$GITHUB_ENV"
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "PATCH_COMMIT=$PATCH_COMMIT" >> "$GITHUB_ENV"
+          echo "STATE=$STATE" >> "$GITHUB_ENV"
+          echo "Detected state: $STATE"
+          echo "Start commit: $START_SHA"
+          echo "Backport base: $BASE_SHA"
+          echo "Backport commit: $PATCH_COMMIT"
+
+      - name: Verify backport
+        run: |
+          set -euo pipefail
+          test "$(git rev-list --count "$BASE_SHA..$PATCH_COMMIT")" -eq 1
+          test "$(git rev-list --merges --count "$BASE_SHA..$PATCH_COMMIT")" -eq 0
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git diff --quiet "$START_SHA" HEAD -- .github/workflows
+          git diff --check "$BASE_SHA" "$PATCH_COMMIT"
+
+          PATCH_PATHS='include/linux/mmzone.h include/trace/events/compaction.h mm/compaction.c mm/internal.h'
+          git diff --quiet "$PATCH_COMMIT" HEAD -- $PATCH_PATHS
+
+          FILES="$RUNNER_TEMP/expected-files"
+          ACTUAL_FILES="$RUNNER_TEMP/actual-files"
+          cat > "$FILES" <<'EOF'
+          include/linux/mmzone.h
+          include/trace/events/compaction.h
+          mm/compaction.c
+          mm/internal.h
+          EOF
+          LC_ALL=C sort "$FILES" -o "$FILES"
+          git diff --name-only "$BASE_SHA" "$PATCH_COMMIT" | LC_ALL=C sort > "$ACTUAL_FILES"
+          diff -u "$FILES" "$ACTUAL_FILES"
+
+          SUBJECTS="$RUNNER_TEMP/expected-subjects"
+          ACTUAL_SUBJECTS="$RUNNER_TEMP/actual-subjects"
+          cat > "$SUBJECTS" <<'EOF'
+          BACKPORT: mm, compaction: use free lists to quickly locate a migration target
+          EOF
+          git log --reverse --format='%s' "$BASE_SHA..$PATCH_COMMIT" > "$ACTUAL_SUBJECTS"
+          diff -u "$SUBJECTS" "$ACTUAL_SUBJECTS"
+
+          AUTHORS="$RUNNER_TEMP/expected-authors"
+          ACTUAL_AUTHORS="$RUNNER_TEMP/actual-authors"
+          cat > "$AUTHORS" <<'EOF'
+          Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>
+          EOF
+          git log --reverse --format='%an <%ae>' "$BASE_SHA..$PATCH_COMMIT" > "$ACTUAL_AUTHORS"
+          diff -u "$AUTHORS" "$ACTUAL_AUTHORS"
+
+          test "$(git log -1 --format=%B "$PATCH_COMMIT" | awk 'NF { line = $0 } END { print line }')" = "Author: @Devandroid-bit."
+          git log -1 --format=%B "$PATCH_COMMIT" > "$RUNNER_TEMP/commit-body"
+          grep -Fq 'Source: Samsung Galaxy S26 Exynos 2600 kernel 6.12.69, mm/compaction.c' "$RUNNER_TEMP/commit-body"
+          grep -Fq 'mainline 5a811889de10' "$RUNNER_TEMP/commit-body"
+          grep -Fq 'Original author: Mel Gorman <mgorman@techsingularity.net>' "$RUNNER_TEMP/commit-body"
+          grep -q 'fast_isolate_freepages' mm/compaction.c
+          grep -q 'mm_compaction_fast_isolate_freepages' include/trace/events/compaction.h
+
+          git log --oneline "$BASE_SHA..$PATCH_COMMIT"
+
+      - name: Push backport commit
+        if: env.STATE == 'apply'
+        run: |
+          set -euo pipefail
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          test "$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")" = "$START_SHA"
+          git push origin "${PATCH_COMMIT}:refs/heads/${TARGET_BRANCH}"
+          echo "PUSHED=1" >> "$GITHUB_ENV"
+          echo "Pushed ${PATCH_COMMIT} to origin/${TARGET_BRANCH}."
+
+      - name: Write apply summary
+        if: always()
+        run: |
+          set -euo pipefail
+          SUMMARY_STATE="${STATE:-unknown}"
+          SUMMARY_START="${START_SHA:-unknown}"
+          SUMMARY_BASE="${BASE_SHA:-unknown}"
+          SUMMARY_COMMIT="${PATCH_COMMIT:-unknown}"
+          SUMMARY_PUSH="Not pushed"
+
+          if [ "${PUSHED:-0}" = "1" ]; then
+            SUMMARY_PUSH="Pushed to origin/${TARGET_BRANCH}"
+          elif [ "$SUMMARY_STATE" = "already-applied" ]; then
+            SUMMARY_PUSH="No push needed (already applied)"
+          fi
+
+          {
+            echo "### Compaction fast-isolate backport apply summary"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Branch | \`${TARGET_BRANCH}\` |"
+            echo "| State | \`${SUMMARY_STATE}\` |"
+            echo "| Start commit | \`${SUMMARY_START}\` |"
+            echo "| Base commit | \`${SUMMARY_BASE}\` |"
+            echo "| Result/backport commit | \`${SUMMARY_COMMIT}\` |"
+            echo "| Push | \`${SUMMARY_PUSH}\` |"
+            echo "| Patch SHA256 | \`${PATCH_SHA256}\` |"
+            echo "| Workflow SHA256 | \`$(sha256sum "$WORKFLOW_PATH" | cut -d' ' -f1)\` |"
+
+            if [ "$SUMMARY_BASE" != "unknown" ] && [ "$SUMMARY_COMMIT" != "unknown" ]; then
+              echo "| Changed files | \`$(git diff --name-only "$SUMMARY_BASE" "$SUMMARY_COMMIT" | wc -l)\` |"
+              echo "| Diff stat | \`$(git diff --shortstat "$SUMMARY_BASE" "$SUMMARY_COMMIT")\` |"
+              echo
+              echo "#### Commit"
+              git log -1 --format='- `%H` %s%n- Author: %an <%ae>' "$SUMMARY_COMMIT"
+              echo
+              echo "#### Files changed"
+              git diff --name-only "$SUMMARY_BASE" "$SUMMARY_COMMIT" | sed 's/^/- `/; s/$/`/'
+              echo
+              echo "#### Commit list"
+              git log --oneline "$SUMMARY_BASE..$SUMMARY_COMMIT" | sed 's/^/- /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
