@@ -260,6 +260,11 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 		p->dirty_segmap = dirty_i->dirty_segmap[type];
 		p->max_search = dirty_i->nr_dirty[type];
 		p->ofs_unit = 1;
+	} else if (p->alloc_mode == AT_SSR) {
+		p->gc_mode = GC_GREEDY;
+		p->dirty_segmap = dirty_i->dirty_segmap[type];
+		p->max_search = dirty_i->nr_dirty[type];
+		p->ofs_unit = 1;
 	} else {
 		p->gc_mode = select_gc_type(sbi, gc_type);
 		p->dirty_segmap = dirty_i->dirty_segmap[DIRTY];
@@ -273,7 +278,7 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 	 */
 	if (gc_type != FG_GC &&
 			(sbi->gc_mode != GC_URGENT) &&
-			p->gc_mode != GC_AT &&
+			(p->gc_mode != GC_AT && p->alloc_mode != AT_SSR) &&
 			p->max_search > sbi->max_victim_search)
 		p->max_search = sbi->max_victim_search;
 
@@ -291,6 +296,8 @@ static unsigned int get_max_cost(struct f2fs_sb_info *sbi,
 	/* SSR allocates in a segment unit */
 	if (p->alloc_mode == SSR)
 		return sbi->blocks_per_seg;
+	if (p->alloc_mode == AT_SSR)
+		return UINT_MAX;
 	if (p->gc_mode == GC_GREEDY)
 		return 2 * sbi->blocks_per_seg * p->ofs_unit;
 	else if (p->gc_mode == GC_CB)
@@ -446,9 +453,11 @@ static void add_victim_entry(struct f2fs_sb_info *sbi,
 	unsigned long long mtime = 0;
 	unsigned int i;
 
-	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED)) &&
+	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
+		if (p->gc_mode == GC_AT &&
 			get_valid_blocks(sbi, segno, true) == 0)
-		return;
+			return;
+	}
 
 	for (i = 0; i < sbi->segs_per_sec; i++)
 		mtime += get_seg_entry(sbi, start + i)->mtime;
@@ -540,6 +549,88 @@ skip:
 	}
 }
 
+static struct victim_entry *__lookup_victim_entry(struct f2fs_sb_info *sbi,
+					unsigned long long mtime)
+{
+	struct atgc_management *am = &sbi->am;
+	struct rb_node *node = am->root.rb_root.rb_node;
+	struct victim_entry *ve = NULL;
+
+	while (node) {
+		ve = rb_entry(node, struct victim_entry, rb_node);
+
+		if (mtime < ve->mtime)
+			node = node->rb_left;
+		else
+			node = node->rb_right;
+	}
+	return ve;
+}
+
+static void atssr_lookup_victim(struct f2fs_sb_info *sbi,
+						struct victim_sel_policy *p)
+{
+	struct sit_info *sit_i = SIT_I(sbi);
+	struct atgc_management *am = &sbi->am;
+	struct victim_entry *ve;
+	unsigned long long age;
+	unsigned long long max_mtime = sit_i->dirty_max_mtime;
+	unsigned long long min_mtime = sit_i->dirty_min_mtime;
+	unsigned int vblocks;
+	unsigned int dirty_threshold = max(am->max_candidate_count,
+					am->candidate_ratio *
+					am->victim_count / 100);
+	unsigned int cost, iter;
+	int stage = 0;
+
+	if (max_mtime < min_mtime)
+		return;
+	max_mtime += 1;
+next_stage:
+	iter = 0;
+	ve = __lookup_victim_entry(sbi, p->age);
+next_node:
+	if (!ve) {
+		if (stage++ == 0)
+			goto next_stage;
+		return;
+	}
+
+	if (ve->mtime >= max_mtime || ve->mtime < min_mtime)
+		goto skip_node;
+
+	age = max_mtime - ve->mtime;
+
+	vblocks = get_seg_entry(sbi, ve->segno)->ckpt_valid_blocks;
+	f2fs_bug_on(sbi, !vblocks);
+
+	/* rare case */
+	if (vblocks == sbi->blocks_per_seg)
+		goto skip_node;
+
+	iter++;
+
+	age = max_mtime - abs(p->age - age);
+	cost = UINT_MAX - vblocks;
+
+	if (cost < p->min_cost ||
+			(cost == p->min_cost && age > p->oldest_age)) {
+		p->min_cost = cost;
+		p->oldest_age = age;
+		p->min_segno = ve->segno;
+	}
+skip_node:
+	if (iter < dirty_threshold) {
+		ve = rb_entry_safe(stage == 0 ? rb_prev(&ve->rb_node) :
+					rb_next(&ve->rb_node),
+					struct victim_entry, rb_node);
+		goto next_node;
+	}
+
+	if (stage++ == 0)
+		goto next_stage;
+}
+
 static void release_victim_entry(struct f2fs_sb_info *sbi)
 {
 	struct atgc_management *am = &sbi->am;
@@ -566,7 +657,8 @@ static void release_victim_entry(struct f2fs_sb_info *sbi)
  * which has minimum valid blocks and removes it from dirty seglist.
  */
 static int get_victim_by_default(struct f2fs_sb_info *sbi,
-		unsigned int *result, int gc_type, int type, char alloc_mode)
+		unsigned int *result, int gc_type, int type, char alloc_mode,
+		unsigned long long age)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct sit_info *sm = SIT_I(sbi);
@@ -580,6 +672,7 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 	last_segment = MAIN_SECS(sbi) * sbi->segs_per_sec;
 
 	p.alloc_mode = alloc_mode;
+	p.age = age;
 	p.age_threshold = sbi->am.age_threshold;
 
 retry:
@@ -589,7 +682,7 @@ retry:
 	p.oldest_age = 0;
 	p.min_cost = get_max_cost(sbi, &p);
 
-	is_atgc = (p.gc_mode == GC_AT);
+	is_atgc = (p.gc_mode == GC_AT || p.alloc_mode == AT_SSR);
 	nsearched = 0;
 
 	if (is_atgc)
@@ -702,9 +795,12 @@ next:
 		}
 	}
 
-	/* get victim for GC_AT */
+	/* get victim for GC_AT/AT_SSR */
 	if (is_atgc) {
-		atgc_lookup_victim(sbi, &p);
+		if (p.gc_mode == GC_AT)
+			atgc_lookup_victim(sbi, &p);
+		else
+			atssr_lookup_victim(sbi, &p);
 		release_victim_entry(sbi);
 	}
 
@@ -1061,6 +1157,7 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	block_t newaddr;
 	int err = 0;
 	bool lfs_mode = f2fs_lfs_mode(fio.sbi);
+	int type = CURSEG_COLD_DATA;
 
 	f2fs_cond_set_fua(&fio);
 
@@ -1152,8 +1249,11 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	}
 
 	/* allocate block address */
+	if (fio.sbi->am.atgc_enabled && gc_type == BG_GC &&
+			fio.sbi->gc_mode != GC_URGENT)
+		type = CURSEG_ALL_DATA_ATGC;
 	err = f2fs_allocate_data_block(fio.sbi, NULL, fio.old_blkaddr, &newaddr,
-				&sum, CURSEG_COLD_DATA, NULL, false);
+				&sum, type, NULL, false);
 	if (err) {
 		f2fs_put_page(mpage, 1);
 		/* filesystem should shutdown, no need to recovery block */
@@ -1260,6 +1360,7 @@ static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 		}
 		set_page_dirty(page);
 		set_cold_data(page);
+		set_page_private_gcing(page);
 	} else {
 		struct f2fs_io_info fio = {
 			.sbi = F2FS_I_SB(inode),
@@ -1472,7 +1573,7 @@ static int __get_victim(struct f2fs_sb_info *sbi, unsigned int *victim,
 
 	down_write(&sit_i->sentry_lock);
 	ret = DIRTY_I(sbi)->v_ops->get_victim(sbi, victim, gc_type,
-					      NO_CHECK_TYPE, LFS);
+					      NO_CHECK_TYPE, LFS, 0);
 	up_write(&sit_i->sentry_lock);
 	return ret;
 }

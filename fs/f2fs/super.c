@@ -117,6 +117,7 @@ enum {
 	Opt_fastboot,
 	Opt_extent_cache,
 	Opt_noextent_cache,
+	Opt_age_extent_cache,
 	Opt_noinline_data,
 	Opt_data_flush,
 	Opt_reserve_root,
@@ -188,6 +189,7 @@ static match_table_t f2fs_tokens = {
 	{Opt_fastboot, "fastboot"},
 	{Opt_extent_cache, "extent_cache"},
 	{Opt_noextent_cache, "noextent_cache"},
+	{Opt_age_extent_cache, "age_extent_cache"},
 	{Opt_noinline_data, "noinline_data"},
 	{Opt_data_flush, "data_flush"},
 	{Opt_reserve_root, "reserve_root=%u"},
@@ -686,7 +688,7 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 		case Opt_active_logs:
 			if (args->from && match_int(args, &arg))
 				return -EINVAL;
-			if (arg != 2 && arg != 4 && arg != NR_CURSEG_TYPE)
+			if (arg != 2 && arg != 4 && arg != NR_CURSEG_PERSIST_TYPE)
 				return -EINVAL;
 			F2FS_OPTION(sbi).active_logs = arg;
 			break;
@@ -719,6 +721,9 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 			break;
 		case Opt_noextent_cache:
 			clear_opt(sbi, EXTENT_CACHE);
+			break;
+		case Opt_age_extent_cache:
+			set_opt(sbi, AGE_EXTENT_CACHE);
 			break;
 		case Opt_noinline_data:
 			clear_opt(sbi, INLINE_DATA);
@@ -1125,9 +1130,9 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 	}
 
 	/* Not pass down write hints if the number of active logs is lesser
-	 * than NR_CURSEG_TYPE.
+	 * than NR_CURSEG_PERSIST_TYPE.
 	 */
-	if (F2FS_OPTION(sbi).active_logs != NR_CURSEG_TYPE)
+	if (F2FS_OPTION(sbi).active_logs != NR_CURSEG_PERSIST_TYPE)
 		F2FS_OPTION(sbi).whint_mode = WHINT_MODE_OFF;
 	return 0;
 }
@@ -1722,6 +1727,8 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 		seq_puts(seq, ",extent_cache");
 	else
 		seq_puts(seq, ",noextent_cache");
+	if (test_opt(sbi, AGE_EXTENT_CACHE))
+		seq_puts(seq, ",age_extent_cache");
 	if (test_opt(sbi, DATA_FLUSH))
 		seq_puts(seq, ",data_flush");
 
@@ -1805,7 +1812,7 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 static void default_options(struct f2fs_sb_info *sbi, bool remount)
 {
 	/* init some FS parameters */
-	F2FS_OPTION(sbi).active_logs = NR_CURSEG_TYPE;
+	F2FS_OPTION(sbi).active_logs = NR_CURSEG_PERSIST_TYPE;
 	F2FS_OPTION(sbi).inline_xattr_size = DEFAULT_INLINE_XATTR_ADDRS;
 	F2FS_OPTION(sbi).whint_mode = WHINT_MODE_OFF;
 	F2FS_OPTION(sbi).alloc_mode = ALLOC_MODE_DEFAULT;
@@ -1981,6 +1988,7 @@ static int f2fs_remount(struct vfsmount *mnt, struct super_block *sb,
 	bool need_restart_gc = false;
 	bool need_stop_gc = false;
 	bool no_extent_cache = !test_opt(sbi, EXTENT_CACHE);
+	bool no_age_extent_cache = !test_opt(sbi, AGE_EXTENT_CACHE);
 	bool no_atgc = !test_opt(sbi, ATGC);
 	bool disable_checkpoint = test_opt(sbi, DISABLE_CHECKPOINT);
 	bool no_io_align = !F2FS_IO_ALIGNED(sbi);
@@ -2063,6 +2071,13 @@ static int f2fs_remount(struct vfsmount *mnt, struct super_block *sb,
 	if (no_extent_cache == !!test_opt(sbi, EXTENT_CACHE)) {
 		err = -EINVAL;
 		f2fs_warn(sbi, "switch extent_cache option is not allowed");
+		goto restore_opts;
+	}
+
+	/* disallow enable/disable age extent_cache dynamically */
+	if (no_age_extent_cache == !!test_opt(sbi, AGE_EXTENT_CACHE)) {
+		err = -EINVAL;
+		f2fs_warn(sbi, "switch age_extent_cache option is not allowed");
 		goto restore_opts;
 	}
 
@@ -3258,7 +3273,7 @@ int f2fs_sanity_check_ckpt(struct f2fs_sb_info *sbi)
 	cp_payload = __cp_payload(sbi);
 	if (cp_pack_start_sum < cp_payload + 1 ||
 		cp_pack_start_sum > blocks_per_seg - 1 -
-			NR_CURSEG_TYPE) {
+			NR_CURSEG_PERSIST_TYPE) {
 		f2fs_err(sbi, "Wrong cp_pack_start_sum: %u",
 			 cp_pack_start_sum);
 		return 1;
@@ -4046,6 +4061,10 @@ try_onemore:
 reset_checkpoint:
 	/* f2fs_recover_fsync_data() cleared this already */
 	clear_sbi_flag(sbi, SBI_POR_DOING);
+
+	err = f2fs_init_inmem_curseg(sbi);
+	if (err)
+		goto sync_free_meta;
 
 	if (test_opt(sbi, DISABLE_CHECKPOINT)) {
 		err = f2fs_disable_checkpoint(sbi);

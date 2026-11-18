@@ -113,6 +113,7 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define F2FS_MOUNT_NOBARRIER		0x00000800
 #define F2FS_MOUNT_FASTBOOT		0x00001000
 #define F2FS_MOUNT_EXTENT_CACHE		0x00002000
+#define F2FS_MOUNT_AGE_EXTENT_CACHE	0x00004000
 #define F2FS_MOUNT_DATA_FLUSH		0x00008000
 #define F2FS_MOUNT_FAULT_INJECTION	0x00010000
 #define F2FS_MOUNT_USRQUOTA		0x00080000
@@ -684,6 +685,7 @@ enum {
 
 /* number of extent info in extent cache we try to shrink */
 #define EXTENT_CACHE_SHRINK_NUMBER	128
+#define AGE_EXTENT_CACHE_SHRINK_NUMBER	128
 
 struct rb_entry {
 	struct rb_node rb_node;		/* rb node located in rb-tree */
@@ -694,7 +696,26 @@ struct rb_entry {
 struct extent_info {
 	unsigned int fofs;		/* start offset in a file */
 	unsigned int len;		/* length of the extent */
-	u32 blk;			/* start block address of the extent */
+	union {
+		struct {
+			u32 blk;	/* start block address of the extent */
+		};
+		struct {
+			unsigned long long age;	/* age of the extent */
+			unsigned long long last_blocks; /* last allocated blocks */
+		};
+	};
+};
+
+struct extent_tree_info {
+	struct radix_tree_root extent_tree_root;
+	struct mutex extent_tree_lock;
+	struct list_head extent_list;
+	spinlock_t extent_lock;
+	atomic_t total_ext_tree;
+	struct list_head zombie_list;
+	atomic_t total_zombie_tree;
+	atomic_t total_ext_node;
 };
 
 struct extent_node {
@@ -863,6 +884,7 @@ struct f2fs_inode_info {
 	struct task_struct *inmem_task;	/* store inmemory task */
 	struct mutex inmem_lock;	/* lock for inmemory pages */
 	struct extent_tree *extent_tree;	/* cached extent_tree entry */
+	struct extent_tree *age_extent_tree;	/* cached age extent_tree entry */
 
 	/* avoid racing between foreground op and gc */
 	struct f2fs_rwsem i_gc_rwsem[2];
@@ -1120,7 +1142,8 @@ static inline void set_new_dnode(struct dnode_of_data *dn, struct inode *inode,
  */
 #define	NR_CURSEG_DATA_TYPE	(3)
 #define NR_CURSEG_NODE_TYPE	(3)
-#define NR_CURSEG_TYPE	(NR_CURSEG_DATA_TYPE + NR_CURSEG_NODE_TYPE)
+#define NR_CURSEG_PERSIST_TYPE	(NR_CURSEG_DATA_TYPE + NR_CURSEG_NODE_TYPE)
+#define NR_CURSEG_TYPE	(NR_CURSEG_PERSIST_TYPE + 1)
 
 enum {
 	CURSEG_HOT_DATA	= 0,	/* directory entry blocks */
@@ -1129,6 +1152,7 @@ enum {
 	CURSEG_HOT_NODE,	/* direct node blocks of directory files */
 	CURSEG_WARM_NODE,	/* direct node blocks of normal files */
 	CURSEG_COLD_NODE,	/* indirect node blocks */
+	CURSEG_ALL_DATA_ATGC,	/* all data blocks in ATGC */
 	NO_CHECK_TYPE,
 	CURSEG_COLD_DATA_PINNED,/* cold data for pinned file */
 };
@@ -1467,6 +1491,7 @@ enum fsync_mode {
  */
 #define ATOMIC_WRITTEN_PAGE		((unsigned long)-1)
 #define DUMMY_WRITTEN_PAGE		((unsigned long)-2)
+#define GCING_WRITTEN_PAGE		((unsigned long)-3)
 
 #define IS_ATOMIC_WRITTEN_PAGE(page)			\
 		(page_private(page) == (unsigned long)ATOMIC_WRITTEN_PAGE)
@@ -1727,6 +1752,11 @@ struct f2fs_sb_info {
 	struct list_head zombie_list;		/* extent zombie tree list */
 	atomic_t total_zombie_tree;		/* extent zombie tree count */
 	atomic_t total_ext_node;		/* extent info count */
+	struct extent_tree_info age_extent_tree;	/* age extent tree info */
+	atomic64_t allocated_data_blocks;	/* allocated data blocks */
+	unsigned int hot_data_age_threshold;
+	unsigned int warm_data_age_threshold;
+	unsigned int last_age_weight;
 
 	/* basic filesystem units */
 	unsigned int log_sectors_per_block;	/* log2 sectors per block */
@@ -3555,6 +3585,26 @@ static inline void f2fs_clear_page_private(struct page *page)
 	f2fs_put_page(page, 0);
 }
 
+static inline bool page_private_gcing(struct page *page)
+{
+	return PagePrivate(page) &&
+		page_private(page) == (unsigned long)GCING_WRITTEN_PAGE;
+}
+
+static inline void set_page_private_gcing(struct page *page)
+{
+	if (PagePrivate(page))
+		return;
+	f2fs_set_page_private(page, (unsigned long)GCING_WRITTEN_PAGE);
+}
+
+static inline void clear_page_private_gcing(struct page *page)
+{
+	if (!page_private_gcing(page))
+		return;
+	f2fs_clear_page_private(page);
+}
+
 /*
  * file.c
  */
@@ -3766,6 +3816,10 @@ void f2fs_update_meta_page(struct f2fs_sb_info *sbi, void *src,
 void f2fs_do_write_meta_page(struct f2fs_sb_info *sbi, struct page *page,
 						enum iostat_type io_type);
 void f2fs_do_write_node_page(unsigned int nid, struct f2fs_io_info *fio);
+int f2fs_init_inmem_curseg(struct f2fs_sb_info *sbi);
+void f2fs_save_inmem_curseg(struct f2fs_sb_info *sbi);
+void f2fs_restore_inmem_curseg(struct f2fs_sb_info *sbi);
+int f2fs_reinit_atgc_curseg(struct f2fs_sb_info *sbi);
 void f2fs_outplace_write_data(struct dnode_of_data *dn,
 			struct f2fs_io_info *fio);
 int f2fs_inplace_write_data(struct f2fs_io_info *fio);
@@ -4230,15 +4284,22 @@ struct rb_entry *f2fs_lookup_rb_tree_ret(struct rb_root_cached *root,
 bool f2fs_check_rb_tree_consistence(struct f2fs_sb_info *sbi,
 						struct rb_root_cached *root);
 unsigned int f2fs_shrink_extent_tree(struct f2fs_sb_info *sbi, int nr_shrink);
+unsigned int f2fs_shrink_age_extent_tree(struct f2fs_sb_info *sbi,
+						int nr_shrink);
 bool f2fs_init_extent_tree(struct inode *inode, struct f2fs_extent *i_ext);
 void f2fs_drop_extent_tree(struct inode *inode);
 unsigned int f2fs_destroy_extent_node(struct inode *inode);
 void f2fs_destroy_extent_tree(struct inode *inode);
 bool f2fs_lookup_extent_cache(struct inode *inode, pgoff_t pgofs,
 			struct extent_info *ei);
+bool f2fs_lookup_age_extent_cache(struct inode *inode, pgoff_t pgofs,
+			struct extent_info *ei);
 void f2fs_update_extent_cache(struct dnode_of_data *dn);
+void f2fs_update_age_extent_cache(struct dnode_of_data *dn);
 void f2fs_update_extent_cache_range(struct dnode_of_data *dn,
 			pgoff_t fofs, block_t blkaddr, unsigned int len);
+void f2fs_update_age_extent_cache_range(struct dnode_of_data *dn,
+			pgoff_t fofs, unsigned int len);
 void f2fs_init_extent_cache_info(struct f2fs_sb_info *sbi);
 int __init f2fs_create_extent_cache(void);
 void f2fs_destroy_extent_cache(void);

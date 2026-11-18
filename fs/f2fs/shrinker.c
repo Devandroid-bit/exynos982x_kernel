@@ -31,7 +31,9 @@ static unsigned long __count_free_nids(struct f2fs_sb_info *sbi)
 static unsigned long __count_extent_cache(struct f2fs_sb_info *sbi)
 {
 	return atomic_read(&sbi->total_zombie_tree) +
-				atomic_read(&sbi->total_ext_node);
+				atomic_read(&sbi->total_ext_node) +
+				atomic_read(&sbi->age_extent_tree.total_zombie_tree) +
+				atomic_read(&sbi->age_extent_tree.total_ext_node);
 }
 
 unsigned long f2fs_shrink_count(struct shrinker *shrink,
@@ -101,6 +103,8 @@ unsigned long f2fs_shrink_scan(struct shrinker *shrink,
 
 		/* shrink extent cache entries */
 		freed += f2fs_shrink_extent_tree(sbi, nr >> 1);
+		if (freed < nr)
+			freed += f2fs_shrink_age_extent_tree(sbi, nr - freed);
 
 		/* shrink clean nat cache entries */
 		if (freed < nr)
@@ -131,6 +135,7 @@ void f2fs_join_shrinker(struct f2fs_sb_info *sbi)
 void f2fs_leave_shrinker(struct f2fs_sb_info *sbi)
 {
 	f2fs_shrink_extent_tree(sbi, __count_extent_cache(sbi));
+	f2fs_shrink_age_extent_tree(sbi, __count_extent_cache(sbi));
 
 	spin_lock(&f2fs_list_lock);
 	list_del_init(&sbi->s_list);

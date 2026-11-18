@@ -393,6 +393,7 @@ static void f2fs_write_end_io(struct bio *bio)
 		if (f2fs_in_warm_node_list(sbi, page))
 			f2fs_del_fsync_node_entry(sbi, page);
 		clear_cold_data(page);
+		clear_page_private_gcing(page);
 		end_page_writeback(page);
 	}
 	if (!get_pages(sbi, F2FS_WB_CP_DATA) &&
@@ -2727,6 +2728,7 @@ int f2fs_do_write_data_page(struct f2fs_io_info *fio)
 	if (fio->old_blkaddr == NULL_ADDR) {
 		ClearPageUptodate(page);
 		clear_cold_data(page);
+		clear_page_private_gcing(page);
 		goto out_writepage;
 	}
 got_it:
@@ -2934,6 +2936,7 @@ out:
 	if (err) {
 		ClearPageUptodate(page);
 		clear_cold_data(page);
+		clear_page_private_gcing(page);
 	}
 
 	if (wbc->for_reclaim) {

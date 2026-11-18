@@ -269,6 +269,10 @@ get_cache:
 						sizeof(struct extent_tree);
 	si->cache_mem += atomic_read(&sbi->total_ext_node) *
 						sizeof(struct extent_node);
+	si->cache_mem += atomic_read(&sbi->age_extent_tree.total_ext_tree) *
+						sizeof(struct extent_tree);
+	si->cache_mem += atomic_read(&sbi->age_extent_tree.total_ext_node) *
+						sizeof(struct extent_node);
 
 	si->page_mem = 0;
 	if (sbi->node_inode) {
