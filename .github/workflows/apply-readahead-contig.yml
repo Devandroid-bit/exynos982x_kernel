@@ -1,0 +1,189 @@
+name: Apply readahead contiguity backport
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to update (must match the fixed target below)"
+        required: true
+        default: "devandroid-droidspaces-mglru-backports-ack"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: readahead-contig-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: devandroid-droidspaces-mglru-backports-ack
+  BASE_SHA: ce38da7839a5c1a3485fe674da3eb6a12097ad8e
+  PATCH_PATH: .github/workflows/readahead-contig.patch
+  WORKFLOW_PATH: .github/workflows/apply-readahead-contig.yml
+  PATCH_SHA256: ec551f3d201ef05c3c097e7e4fe04d3fc643502b519cf98ba8f763fde273c920
+  SOURCE_TREE: e72be68c4f8883f3db668cef8a801a64e14efe24
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout dispatched target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate target, patch, and base
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$GITHUB_REF" = "refs/heads/${TARGET_BRANCH}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$PATCH_PATH"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test "$(grep -c '^From [0-9a-f]\{40\} ' "$PATCH_PATH")" -eq 1
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test -z "$(git status --porcelain)"
+          echo "START_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "PUSH_STATUS=not pushed" >> "$GITHUB_ENV"
+
+      - name: Detect target state
+        run: |
+          set -euo pipefail
+          START_SHA=${START_SHA:?}
+          BASE_FILES="$RUNNER_TEMP/expected-control-files"
+          ACTUAL_BASE_FILES="$RUNNER_TEMP/actual-base-files"
+          VERIFY_FILES="$RUNNER_TEMP/expected-verify-files"
+          ACTUAL_VERIFY_FILES="$RUNNER_TEMP/actual-verify-files"
+
+          printf '%s\n' "$WORKFLOW_PATH" "$PATCH_PATH" | LC_ALL=C sort > "$BASE_FILES"
+          git diff --name-only "$BASE_SHA" "$START_SHA" | LC_ALL=C sort > "$ACTUAL_BASE_FILES"
+
+          if cmp -s "$BASE_FILES" "$ACTUAL_BASE_FILES" &&
+             git diff --quiet "$BASE_SHA" "$START_SHA" -- . ':(exclude).github/workflows'; then
+            STATE=apply
+            VERIFY_BASE=$START_SHA
+          else
+            VERIFY_BASE=$(git rev-parse "${START_SHA}~1")
+            test "$(git rev-list --count "$VERIFY_BASE..$START_SHA")" -eq 1
+            git diff --name-only "$BASE_SHA" "$VERIFY_BASE" | LC_ALL=C sort > "$ACTUAL_VERIFY_FILES"
+            cmp -s "$BASE_FILES" "$ACTUAL_VERIFY_FILES"
+            git diff --quiet "$BASE_SHA" "$VERIFY_BASE" -- . ':(exclude).github/workflows'
+            git cat-file -e "${VERIFY_BASE}:${WORKFLOW_PATH}"
+            git cat-file -e "${VERIFY_BASE}:${PATCH_PATH}"
+            STATE=already-applied
+          fi
+
+          echo "STATE=$STATE" >> "$GITHUB_ENV"
+          echo "VERIFY_BASE=$VERIFY_BASE" >> "$GITHUB_ENV"
+          echo "Detected state: $STATE"
+          echo "Start commit: $START_SHA"
+          echo "Backport base: $VERIFY_BASE"
+
+      - name: Apply patch in place
+        if: env.STATE == 'apply'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git am --keep-cr "$PATCH_PATH"; then
+            git am --abort || true
+            exit 1
+          fi
+
+      - name: Verify one backport
+        run: |
+          set -euo pipefail
+          test -n "$VERIFY_BASE"
+          test "$(git rev-list --count "$VERIFY_BASE..HEAD")" -eq 1
+          test "$(git rev-list --merges --count "$VERIFY_BASE..HEAD")" -eq 0
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum "$PATCH_PATH" | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git diff --check "$VERIFY_BASE" HEAD
+          git diff --quiet "$START_SHA" HEAD -- .github/workflows
+
+          SOURCE_FILES="$RUNNER_TEMP/expected-source-files"
+          ACTUAL_SOURCE_FILES="$RUNNER_TEMP/actual-source-files"
+          printf '%s\n' "mm/readahead.c" | LC_ALL=C sort > "$SOURCE_FILES"
+          git diff --name-only "$VERIFY_BASE" HEAD | LC_ALL=C sort > "$ACTUAL_SOURCE_FILES"
+          diff -u "$SOURCE_FILES" "$ACTUAL_SOURCE_FILES"
+
+          SOURCE_INDEX="$RUNNER_TEMP/source-tree-index"
+          rm -f "$SOURCE_INDEX"
+          cp "$(git rev-parse --git-path index)" "$SOURCE_INDEX"
+          GIT_INDEX_FILE="$SOURCE_INDEX" git rm --cached -q "$WORKFLOW_PATH" "$PATCH_PATH"
+          test "$(GIT_INDEX_FILE="$SOURCE_INDEX" git write-tree)" = "$SOURCE_TREE"
+          rm -f "$SOURCE_INDEX"
+
+          test "$(git log -1 --format='%s')" = "BACKPORT: mm: refresh file readahead window and contiguity"
+          test "$(git log -1 --format='%an <%ae>')" = "Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>"
+          git log -1 --format=%B > "$RUNNER_TEMP/commit-body"
+          test "$(grep -Fxc 'Signed-off-by: Devandroid-bit <180217512+Devandroid-bit@users.noreply.github.com>' "$RUNNER_TEMP/commit-body")" -eq 1
+          test "$(grep -Fxc 'Author: @Devandroid-bit.' "$RUNNER_TEMP/commit-body")" -eq 1
+          grep -Fq 'Samsung Galaxy S26 Exynos 2600 kernel 6.12.69' "$RUNNER_TEMP/commit-body"
+          grep -Fq 'mm/readahead.c' "$RUNNER_TEMP/commit-body"
+
+          git log --oneline "$VERIFY_BASE..HEAD"
+          echo "RESULT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Push target branch
+        env:
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_INPUT" = "$TARGET_BRANCH"
+          test "$(git rev-parse HEAD)" = "${RESULT_SHA:?}"
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          REMOTE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+          HEAD_SHA=$(git rev-parse HEAD)
+
+          if [ "$REMOTE_SHA" = "$HEAD_SHA" ]; then
+            echo "PUSH_STATUS=not pushed (already present)" >> "$GITHUB_ENV"
+            echo "Target branch already has the expected commit; nothing to push."
+          elif [ "$STATE" = "apply" ] && [ "$REMOTE_SHA" = "$START_SHA" ]; then
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+            test "$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")" = "$HEAD_SHA"
+            echo "PUSH_STATUS=pushed" >> "$GITHUB_ENV"
+            echo "Pushed backport commit $HEAD_SHA to $TARGET_BRANCH."
+          else
+            echo "::error::Target branch changed during workflow; expected $START_SHA or $HEAD_SHA, found $REMOTE_SHA."
+            exit 1
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          set +e
+          WORKFLOW_SHA256=$(sha256sum "$WORKFLOW_PATH" 2>/dev/null | cut -d' ' -f1)
+          {
+            echo "### Readahead contiguity backport"
+            echo "- Branch: \`${TARGET_BRANCH:-unknown}\`"
+            echo "- State: \`${STATE:-unknown}\`"
+            echo "- Start commit: \`${START_SHA:-unknown}\`"
+            echo "- Base commit: \`${BASE_SHA:-unknown}\`"
+            echo "- Result commit: \`${RESULT_SHA:-not available}\`"
+            echo "- Push status: \`${PUSH_STATUS:-not pushed}\`"
+            echo "- Patch SHA-256: \`${PATCH_SHA256:-unknown}\`"
+            echo "- Workflow SHA-256: \`${WORKFLOW_SHA256:-not available}\`"
+            if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+              if [ -n "${VERIFY_BASE:-}" ] && git cat-file -e "${VERIFY_BASE}^{commit}" 2>/dev/null; then
+                FILES=$(git diff --name-only "$VERIFY_BASE" HEAD 2>/dev/null | LC_ALL=C sort)
+                COMMITS=$(git log --format='- `%h` %s' "$VERIFY_BASE..HEAD" 2>/dev/null)
+              else
+                FILES=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null | LC_ALL=C sort)
+                COMMITS=$(git log --format='- `%h` %s' "$BASE_SHA..HEAD" 2>/dev/null)
+              fi
+              CHANGED_COUNT=$(printf '%s\n' "$FILES" | sed '/^$/d' | wc -l | tr -d ' ')
+              COMMIT_COUNT=$(printf '%s\n' "$COMMITS" | sed '/^$/d' | wc -l | tr -d ' ')
+              echo "- Changed files (${CHANGED_COUNT}):"
+              printf '%s\n' "$FILES" | sed '/^$/d; s/^/  - /'
+              echo "- Commits (${COMMIT_COUNT}):"
+              printf '%s\n' "$COMMITS" | sed '/^$/d; s/^/  /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
